@@ -1,0 +1,90 @@
+# Fork-only workflow: keeps the fork current with the official repo and publishes a
+# Windows setup whose Wine refusal is disabled, so it can be installed on Linux
+# under Wine (fork/README.md). Lives only in this fork; nothing is sent upstream.
+name: Wine build (fork)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 6 * * *'   # daily, a little off the hour
+  push:
+    paths: ['fork/**']
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with the official repo
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.state.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream main
+        run: |
+          git config user.name "N4ML355"
+          git config user.email "N4ML355@users.noreply.github.com"
+          git remote add upstream https://github.com/sweeax-exe/ffny-online.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already current with upstream main."
+          else
+            git merge upstream/main --no-edit
+            git push origin main
+          fi
+      - name: The Wine patch still applies to the merged sources
+        run: python3 fork/patch-wine.py --check
+      - id: state
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Windows setup (Wine check disabled)
+    needs: sync
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install pytest Pillow==12.3.0 numpy==2.5.2
+      - name: Apply the fork's Wine patch (build time only; never committed)
+        run: python fork/patch-wine.py
+      - name: Build the game-free setup
+        shell: pwsh
+        run: ./scripts/build-setup.ps1
+      - name: Smoke the patched setup
+        shell: pwsh
+        run: |
+          $ui = Start-Process -FilePath (Resolve-Path build/setup/DefJamSetup.exe).Path `
+                  -ArgumentList '--ui-smoke' -WindowStyle Hidden -Wait -PassThru
+          if ($ui.ExitCode -ne 0) { throw 'The patched setup failed its window smoke test' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup-wine
+          path: build/setup-assets/*
+          if-no-files-found: error
+      - name: Publish the rolling wine-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $build = (Get-Content config\remaster-version.txt -TotalCount 1).Trim()
+          $sha = "${{ needs.sync.outputs.sha }}".Substring(0, 12)
+          $notes = @(
+            "FFNY Online build $build, built from the official repo at commit $sha,",
+            "with the setup's Wine check disabled by fork/patch-wine.py (run at build time; nothing else is changed).",
+            "",
+            "Install on Linux under Wine: see fork/README.md in this repository.",
+            "Do not accept in-game launcher updates: an official update brings the Wine check back.",
+            "The online servers are untouched; you play against the same people as everyone else."
+          ) -join "`n"
+          gh release delete wine-latest --yes --cleanup-tag 2>$null
+          if ($LASTEXITCODE -ne 0) { $global:LASTEXITCODE = 0 }
+          gh release create wine-latest build/setup-assets/* `
+            --title "FFNY Online build $build (Wine check disabled)" --notes $notes
