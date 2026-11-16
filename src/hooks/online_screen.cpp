@@ -59,6 +59,7 @@
 #include "start_countdown.h"
 #include "milestones.h"
 #include "season_search.h"
+#include "fighter_skins.h"
 #include "pc_content.h"
 #include "pc_mods.h"
 #include "music_library.h"
@@ -459,6 +460,7 @@ float hint(ImDrawList *dl, const Frame &f, float x, float y, const char *button,
 }
 
 int content_news(char *names, int size);
+bool content_problem(char *out, int size);
 // The page title in the corner, as the game writes MAIN MENU.
 void page_title(ImDrawList *dl, const Frame &f, const char *title)
 {
@@ -473,13 +475,20 @@ void page_title(ImDrawList *dl, const Frame &f, const char *title)
         rect(dl, f, 606 - w - 10, 8, w + 20, 20, IM_COL32(150, 14, 30, 230), 4);
         text(dl, f, g_title, 12, 606, 11, WHITE, line, RIGHT, 1.0f);
         text(dl, f, g_hand, 11, 606, 30, ORANGE, "close the game: the launcher installs it", RIGHT, 0.8f);
+    } else if (content_problem(nullptr, 0)) {
+        // build 83: the last content sync (or the game's own check) failed: this PC may lack packs others have
+        const char *line = "COMMUNITY CONTENT NOT UPDATED";
+        float w = text_width(f, g_title, 12, line);
+        rect(dl, f, 606 - w - 10, 8, w + 20, 20, IM_COL32(150, 14, 30, 230), 4);
+        text(dl, f, g_title, 12, 606, 11, WHITE, line, RIGHT, 1.0f);
+        text(dl, f, g_hand, 11, 606, 30, ORANGE, "start the game from the launcher again", RIGHT, 0.8f);
     } else if (content_news(nullptr, 0) > 0) {
         // build 82: new community content is out (the game's own catalogue check): announced the same way
         const char *line = "NEW COMMUNITY CONTENT IS OUT";
         float w = text_width(f, g_title, 12, line);
         rect(dl, f, 606 - w - 10, 8, w + 20, 20, IM_COL32(150, 14, 30, 230), 4);
         text(dl, f, g_title, 12, 606, 11, WHITE, line, RIGHT, 1.0f);
-        text(dl, f, g_hand, 11, 606, 30, ORANGE, "restart FFNY Online to get it", RIGHT, 0.8f);
+        text(dl, f, g_hand, 11, 606, 30, ORANGE, "close the game, start it from the launcher", RIGHT, 0.8f);
     }
 }
 
@@ -915,6 +924,11 @@ struct State {
     int name_pos = 0, name_cp = -1;
     int fighters_cp = -1;           // FIGHTERS: the selected card's cp_cards index, -1 a roster fighter
     bool random_pick = false;       // FIGHTERS: the last pick was the RANDOM card (the hub says so)
+    // build 85: the skin window over CHOOSE FIGHTER (skins_ui.inc): open, for which fighter, its choice, since when;
+    // pick_skin: the look of the last pick (0 Default; RANDOM is always Default)
+    bool skin_open = false;
+    int skin_fe = -1, skin_sel = 0, pick_skin = 0;
+    ULONGLONG skin_opened = 0;
     uint32_t watch_hidden = 0;      // King of the Hill: the fight whose watching screen B closed
     unsigned long long give_up_at = 0, lb_since = 0;    // King of the Hill: LB gave up the spot; LB held since
     bool lb_long_done = false;      // the long LB press has acted
@@ -1227,6 +1241,53 @@ int content_news(char *names, int size)
     }
     if (names && size > 0) snprintf(names, (size_t)size, "%s", cached_names);
     return cached;
+}
+// Build 83: the last community content sync failed, or the game's own check did (pc_content_problem: sync-result.ini
+// and news.ini), as one plain line; read every 3 s. The gallery: only its own pages (RECOMP_TEST_CONTENT_SYNC).
+bool content_problem(char *out, int size)
+{
+    if (out && size > 0) out[0] = 0;
+    if (gallery_on() && !(G.page && (!strcmp(G.page, "hub-sync-failed") || !strcmp(G.page, "rooms-sync-failed"))))
+        return false;
+    static unsigned long long read_at;
+    static bool cached;
+    static char line[512];
+    unsigned long long now = GetTickCount64();
+    if (!read_at || now - read_at > 3000) {
+        read_at = now;
+        cached = pc_content_problem(line, sizeof(line)) != 0;
+    }
+    if (out && size > 0) snprintf(out, (size_t)size, "%s", cached ? line : "");
+    return cached;
+}
+// Build 83: players this PC cannot meet because their community content differs: online minus the relays' STATUS
+// Same (players with exactly this PC's fingerprint), on the hub's relay or, with All servers, on every relay that
+// says it. -1 when no relay says (relays before build 83).
+int servers(NetServerInfo *out);
+int connected_server();
+bool all_servers();
+int other_content_players(int *same_out)
+{
+    NetServerInfo sv[NETSERVER_COUNT];
+    servers(sv);
+    int here = connected_server(), online = 0, same = 0, known = 0;
+    for (int i = 0; i < NETSERVER_COUNT; i++) {
+        if ((!all_servers() && i != here) || sv[i].state != NETSERVER_UP || !(sv[i].flags & NETSERVER_SAME) ||
+            sv[i].same < 0)
+            continue;
+        online += sv[i].online;
+        same += sv[i].same;
+        known = 1;
+    }
+    if (same_out) *same_out = same;
+    return known ? std::max(0, online - same) : -1;
+}
+// The room list or the player list is empty while many are online: is it the content split? At least three others,
+// and more than the players on this PC's content.
+bool content_split_shown()
+{
+    int same = 0, other = other_content_players(&same);
+    return other >= 3 && other > same;
 }
 // A fighter this room's FIGHTER RULES leave out (the relay names them in ROOM; NETPLAY_CREATED_FIGHTER for
 // created fighters). Out of a room, none.
@@ -1807,6 +1868,8 @@ void draw_players(ImDrawList *dl, const Frame &f, const Pad &pad)
     if (n == 0)
         text(dl, f, g_title, 14, 320, 200, GREY, all ? "Nobody with this version on any server right now." :
              "Nobody else with this version right now.", CENTER, 1.0f);
+    if (n <= 1 && content_split_shown())    // build 83: only this PC listed while many are online
+        text(dl, f, g_hand, 13, 320, 228, ORANGE, PC_CONTENT_SPLIT_LINE ".", CENTER, 0.8f);
     if (!all && here >= 0) {    // the other servers' players, from their STATUS
         std::string more;
         for (int i = 0; i < NETSERVER_COUNT; i++) {
@@ -2014,15 +2077,23 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         if (us >= UPDATER_AVAILABLE && us <= UPDATER_STARTED) updater_info(&newer, nullptr, 0, nullptr, 0);
     }
     bool outdated = updater_local_build() > 0 && newer > updater_local_build();
-    char news_names[256];
+    char news_names[256], problem[512];
     int news = content_news(news_names, sizeof(news_names));
+    bool content_bad = content_problem(problem, sizeof(problem));
     if (outdated) {
         char line[96];
         snprintf(line, sizeof(line), "BUILD %d IS OUT: UPDATE IN THE LAUNCHER TO PLAY ONLINE", newer);
         text(dl, f, g_title, 14, 50, 56, ORANGE, line, LEFT, 1.2f);
+    } else if (content_bad && signed_in) {
+        // build 83: the last sync failed (e.g. the PC's root store or clock), so this PC may lack packs the others
+        // have and see none of their rooms: the reason in plain words, on one line where it fits
+        float size = std::max(9.0f, fit_size(f, g_hand, 13, problem, 556));
+        text(dl, f, g_hand, size, 50, size < 11 ? 50 : 54, ORANGE, problem, LEFT, 0.8f, 556);
     } else if (news > 0 && signed_in) {
         // build 82: new community packs: the rooms of players who have them take only PCs with the same packs
-        text(dl, f, g_title, 14, 50, 56, ORANGE, upper(NETPLAY_CONTENT_NEWS_LINE).c_str(), LEFT, 1.2f);
+        std::string news_line = upper(NETPLAY_CONTENT_NEWS_LINE);
+        text(dl, f, g_title, std::min(14.0f, fit_size(f, g_title, 14, news_line.c_str(), 556)), 50, 56, ORANGE,
+             news_line.c_str(), LEFT, 1.2f);
     } else if (signed_in) {
         // build 83: the ranked season's countdown (and the Turf War's), where the line is free
         std::string l = ranked_shown() ? season_countdown() : std::string();
@@ -2030,11 +2101,17 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         if (!t.empty()) l += (l.empty() ? "" : "    -    ") + t;
         if (!l.empty()) text(dl, f, g_title, 14, 50, 56, CREAM, l.c_str(), LEFT, 1.2f, 556);
     } else {
+        // sign-in without Discord (a username and a password) is in the launcher and in F1 > Online, where a
+        // keyboard can type (pc_launcher_password.inc); here only the hint, while the service offers it
+        bool pw = account_password_offered(nullptr, nullptr, 0) != 0;
         const char *line = acc == ACCOUNT_WAITING ? "FINISH SIGNING IN WITH DISCORD IN YOUR BROWSER..."
-                         : acc == ACCOUNT_CHECKING ? "CHECKING YOUR DISCORD SIGN-IN..."
-                         : "SIGN IN WITH DISCORD TO FIGHT ONLINE";
+                         : acc == ACCOUNT_CHECKING ? "CHECKING YOUR SIGN-IN..."
+                         : pw ? "SIGN IN TO FIGHT ONLINE" : "SIGN IN WITH DISCORD TO FIGHT ONLINE";
         text(dl, f, g_title, 14, 50, 56, ORANGE, line, LEFT, 1.2f);
-        if (acc == ACCOUNT_OUT || acc == ACCOUNT_FAILED) hint(dl, f, 50 + text_width(f, g_title, 14, line) + 14, 55, "y", "SIGN IN");
+        if (pw && (acc == ACCOUNT_OUT || acc == ACCOUNT_FAILED))
+            text(dl, f, g_hand, 9, 50, 67, with_alpha(CREAM, 0.8f), "NO DISCORD? SIGN IN WITHOUT IT IN THE LAUNCHER OR IN F1 > ONLINE",
+                 LEFT, 1.0f);
+        if (acc == ACCOUNT_OUT || acc == ACCOUNT_FAILED) hint(dl, f, 50 + text_width(f, g_title, 14, line) + 14, 55, "y", pw ? "DISCORD" : "SIGN IN");
         if (pad.y && (acc == ACCOUNT_OUT || acc == ACCOUNT_FAILED)) {
             account_sign_in();
             say("Your browser opens: sign in with Discord, then come back.");
@@ -2411,11 +2488,18 @@ void draw_rooms(ImDrawList *dl, const Frame &f, const Pad &pad)
     page_title(dl, f, "FIND A ROOM");
     if (all) text(dl, f, g_hand, 14, 54, 58, ORANGE, "All servers: the lowest ping first.", LEFT, 0.8f);
     online_count(dl, f);
+    // build 83: nobody's rooms show while many are online: most of them have other community content
+    bool split = !n && content_split_shown();
     if (n) glass(dl, f, 36, 76, 290, (std::min(n, 6) - 1) * 52 + 44 + 20);
-    else glass(dl, f, 36, 112, 290, 76);
+    else glass(dl, f, 36, 112, 290, split ? 124 : 76);
     if (!n) {
         text(dl, f, g_title, 16, 60, 130, GREY, all ? "No open rooms on any server." : "No open rooms right now.");
         text(dl, f, g_hand, 14, 60, 156, ORANGE, "Quick match, or open one yourself.", LEFT, 0.8f);
+        if (split) {
+            char problem[512];
+            text(dl, f, g_hand, 13, 60, 182, CREAM,
+                 content_problem(problem, sizeof(problem)) ? problem : PC_CONTENT_SPLIT_LINE ".", LEFT, 0.8f, 250);
+        }
     }
     int top = std::max(0, std::min(S.rooms_sel - 2, n - 6));
     for (int i = top; i < n && i < top + 6; i++) {
@@ -2947,8 +3031,13 @@ int grid_pos(const std::vector<OnlineFighter> &list, int fighter)
     return at;
 }
 
-void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad, bool *chosen, int *fighter)
+#include "skins_ui.inc"
+
+void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chosen, int *fighter)
 {
+    // build 85: while the skin window is open the grid takes no input (the window does, below)
+    Pad idle = {};
+    const Pad &pad = S.skin_open ? idle : pad_in;
     const auto &list = grid_fighters();
     int n = (int)list.size();
     const int cols = 7, rows = 4;
@@ -3123,10 +3212,35 @@ void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad, bool *chosen,
         }
         int pick_cp = pick < (int)g_grid_cp.size() ? g_grid_cp[pick] : -1;
         if (pick_cp >= 0) cp_choose(pick_cp);   // which created fighter: remembered, and sent to the relay
-        *chosen = true;
-        *fighter = list[pick].id;
-        if (!S.random_pick) pc_content_picked_fighter(*fighter);     // build 82: its NEW badge goes
-        if (S.random_pick) S.fighter_sel = pick;    // back here later: on the fighter it drew
+        S.pick_skin = 0;
+        if (!S.random_pick && pick_cp < 0 && list[pick].id < 98 && fighter_skins_count(list[pick].id) > 0) {
+            // build 85: a fighter with skins: the skin window first, on the look played last with it
+            S.skin_open = true;
+            S.skin_fe = list[pick].id;
+            S.skin_sel = fighter_skins_remembered(S.skin_fe);
+            S.skin_opened = GetTickCount64();
+            { Pad none = {}; skin_test_keys(none, true); }
+            fprintf(stderr, "[SKINS] hub: %s has %d skin(s): the skin window, on %d\n", list[pick].name,
+                    fighter_skins_count(S.skin_fe), S.skin_sel);
+        } else {
+            *chosen = true;
+            *fighter = list[pick].id;
+            if (!S.random_pick) pc_content_picked_fighter(*fighter);     // build 82: its NEW badge goes
+            if (S.random_pick) S.fighter_sel = pick;    // back here later: on the fighter it drew
+        }
+    }
+    if (S.skin_open) {
+        // the press that opened it must not take the first look at once
+        int r = skin_window(dl, f, GetTickCount64() - S.skin_opened > 250 ? pad_in : idle, S.skin_fe, &S.skin_sel);
+        if (r == 1) {
+            S.pick_skin = S.skin_sel;
+            fighter_skins_remember(S.skin_fe, S.skin_sel);
+            *chosen = true;
+            *fighter = S.skin_fe;
+            pc_content_picked_fighter(*fighter);
+            fprintf(stderr, "[SKINS] hub: feID %d with skin %d\n", S.skin_fe, S.skin_sel);
+        }
+        if (r) S.skin_open = false;
     }
     // BACK from a ranked search's pick goes back to the mode chooser, not to the online menu (a player
     // who wanted another fighter for ranked landed on the hub, 2026-11-03)
@@ -3395,6 +3509,19 @@ int my_hill_fighter(const NetRoom &r)
     return m.pick >= 0 ? m.pick : slot_fighter(r, r.you);
 }
 
+// The line under the watching screens. Build 84: a player who came in while the fight ran has no WATCH
+// for it (the relay sends one when the fight starts; a fight cannot be joined halfway), so it says when
+// the live picture comes instead of promising it now (a player report, 2026-11-15: the ones waiting in an
+// FFA rotation room "can't watch the match").
+static const char *watch_hint(const NetHill &h)
+{
+    if (!((lobby_caps() & NETPLAY_CAP_HILL_WATCH) && hill_watch_setting()))
+        return "The fight runs on the fighters' PCs. The result comes here when it is over.";
+    if (!(h.watch_seed && h.watch_seed == h.seed))
+        return "This fight began before you came in. You watch the next one live; the result comes here.";
+    return "Watching live: the next fight shows on your screen. The result comes here when it is over.";
+}
+
 // The watching screen: the fight this PC does not play in. Phase 1 shows who fights, the king's
 // crown and streak, and the line; the fight itself runs on the fighters' PCs only.
 void draw_watch_rot(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom &r, const HillView &v);
@@ -3449,10 +3576,7 @@ void draw_watch(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom &r
     glass(dl, f, 40, 382, 560, 28, 8);
     text(dl, f, g_title, 14, 52, 388, WHITE, line.c_str(), LEFT, 1.0f);
     if (v.next == r.you) text(dl, f, g_hand, 18, 588, 386, ORANGE, "YOU'RE UP NEXT", RIGHT, 1.2f);
-    text(dl, f, g_title, 11, 320, 362, GREY, (lobby_caps() & NETPLAY_CAP_HILL_WATCH) && hill_watch_setting()
-             ? "Watching live: the next fight shows on your screen. The result comes here when it is over."
-             : "The fight runs on the fighters' PCs. The result comes here when it is over.",
-         CENTER, 0.8f);
+    text(dl, f, g_title, 11, 320, 362, GREY, watch_hint(h), CENTER, 0.8f);
     float hx = 54;
     bool left = false;
     hx += hint(dl, f, hx, 414, "x", "CHOOSE FIGHTER");
@@ -3501,6 +3625,8 @@ void draw_watch_rot(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoo
     text(dl, f, g_stencil, 30, 320, 326, CREAM, n > 2 ? "FREE FOR ALL" : "ONE ON ONE", CENTER, 1.6f);
     if (from_watch && h.watch_venue)
         text(dl, f, g_hand, 14, 320, 360, ORANGE, upper(online_venue_name(h.watch_venue)).c_str(), CENTER, 0.8f, 300);
+    else if (!from_watch)   // build 84: came in during the fight: when the live picture comes
+        text(dl, f, g_title, 11, 320, 362, GREY, watch_hint(h), CENTER, 0.8f);
     std::string line = "NEXT:";
     int shown = 0;
     for (int i = 0; i < h.count && shown < 4; i++) {
@@ -4676,6 +4802,8 @@ void gallery_step()
                                          "room-special", "vote-team",
                                          // build 67: RANDOM in the grid and in the vote
                                          "fighters-random", "vote-random",
+                                         // build 85: the skin window over CHOOSE FIGHTER (a fighter with skins, else none)
+                                         "fighters-skins",
                                          "ranked", "voice", "music", "music-own", "music-empty", "stats", "stats-1v1", "players", "fighters",
                                          // build 47: every server's players (All servers)
                                          "players-all",
@@ -4695,6 +4823,9 @@ void gallery_step()
                                          "fighters-new", "vote-new", "hub-news",
                                          // build 83: the hub fighter search (a query; one nothing matches)
                                          "fighters-search", "fighters-search-none",
+                                         // build 83: the last content sync failed (RECOMP_TEST_CONTENT_SYNC=<reason>), and the
+                                         // empty room list while most players have other community content
+                                         "hub-sync-failed", "rooms-split", "rooms-sync-failed",
                                          // build 66: FFA rotation (its room, called, watching, its door)
                                          "rot", "rot-up", "rot-watch", "rot-fight", "create-rot", "hub-rot", "versus-rot",
                                          // build 70: the spectator HUD over a watched fight (the line, up next,
@@ -4882,6 +5013,7 @@ void gallery_step()
     G.results_slots = 0;
     G.maint_secs = -1;
     QW.open = QW.gallery = false;
+    S.skin_open = false;                // build 85: the skin window only on its own page
     G.rollback = G.rb_must = false;
     for (int i = 0; i < NETPLAY_ROOM_SLOTS; i++) G.room_rb[i] = -1;
     G.crew = NetCrew();
@@ -4956,7 +5088,7 @@ void gallery_step()
         if (p == "fighters-standard") {
             G.room.settings.fighter_rules = NETPLAY_RULES_STANDARD;
             G.room.blocked_count = 0;
-            for (int id = 100; id <= 127; id++) G.room.blocked[G.room.blocked_count++] = (unsigned char)id;
+            for (int k = 0; k < NEW_FIGHTER_MAX; k++) G.room.blocked[G.room.blocked_count++] = (unsigned char)new_fighter_place_id(k);
         }
         S.fighter_sel = 0;
         S.fighter_top = 0;
@@ -4975,6 +5107,15 @@ void gallery_step()
         S.vote_sel = 1;
     }
     else if (p == "hub-news") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }
+    else if (p == "hub-sync-failed") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }
+    else if (p == "rooms-split" || p == "rooms-sync-failed") {     // 22 on Europe, 1 of them on this PC's content
+        S.page = ROOMS;
+        S.rooms_sel = 0;
+        G.rooms.clear();
+        G.servers[NETSERVER_EU].online = 22;
+        G.servers[NETSERVER_EU].same = 1;
+        G.servers[NETSERVER_EU].flags |= NETSERVER_SAME;
+    }
     else if (p == "code") { S.page = CODE; snprintf(S.code, sizeof(S.code), "GTE4AQ"); S.code_pos = 3; }
     else if (p.compare(0, 6, "create") == 0) {     // every venue; -3, -6: two presets; -1: one venue
         S.page = SETTINGS;
@@ -5018,6 +5159,21 @@ void gallery_step()
     else if (p == "players") S.page = PLAYERS;
     else if (p == "players-all") { S.page = PLAYERS; G.choice = NETCHOICE_ALL; }
     else if (p == "fighters") { S.page = FIGHTERS; S.fighter_sel = 9; S.fighter_top = 0; }
+    else if (p == "fighters-skins") {   // build 85: the first fighter of the grid that has skins, its window open
+        S.page = FIGHTERS;
+        S.fighter_top = 0;
+        const auto &list = grid_fighters();
+        for (int i = 0; i < (int)list.size(); i++)
+            if (list[i].id >= 0 && list[i].id < 98 && fighter_skins_count(list[i].id) > 0) {
+                S.fighter_sel = i;
+                S.fighter_top = i / 7 > 3 ? i / 7 - 3 : 0;
+                S.skin_open = true;
+                S.skin_fe = list[i].id;
+                S.skin_sel = 1;
+                S.skin_opened = GetTickCount64();
+                break;
+            }
+    }
     else if (p == "fighters-rules") {   // a room of stock fighters and no banned tier: two fighters blocked, one chosen
         S.page = FIGHTERS;
         G.room = sample_room(0, 2, 2);
@@ -5448,6 +5604,41 @@ bool exit_chip_at(float x, float y)
 {
     if (now_ms() - g_exit_chip_ms > 300) return false;
     return x >= g_exit_chip.x && x < g_exit_chip.z && y >= g_exit_chip.y && y < g_exit_chip.w;
+}
+
+// ---- the skin window over the game's own select screens (build 85, skins_ui.inc) ----
+
+static struct { int slot, fe, sel; ULONGLONG opened; } g_sw;
+
+bool take_skin_window_request()
+{
+    int slot, fe;
+    if (!fighter_skins_take_window(&slot, &fe)) return false;
+    g_sw.slot = slot;
+    g_sw.fe = fe;
+    g_sw.sel = fighter_skins_remembered(fe);
+    g_sw.opened = GetTickCount64();
+    { Pad none = {}; skin_test_keys(none, true); }
+    fprintf(stderr, "[SKINS] skin window: slot %d, feID %d, %d skin(s), on %d\n", slot, fe, fighter_skins_count(fe), g_sw.sel);
+    return true;
+}
+
+bool draw_skin_window(ImVec2 display)
+{
+    Frame f = menu_frame(display);
+    Pad idle = {};
+    Pad pad = GetTickCount64() - g_sw.opened > 300 ? read_pad() : idle;    // not the A that picked the fighter
+    int r = skin_window(ImGui::GetForegroundDrawList(), f, pad, g_sw.fe, &g_sw.sel);
+    if (!r) return false;
+    if (r == 1) {
+        fighter_skins_set_slot(g_sw.slot, g_sw.fe, g_sw.sel);
+        fighter_skins_remember(g_sw.fe, g_sw.sel);
+        fprintf(stderr, "[SKINS] skin window: slot %d takes %s\n", g_sw.slot, g_sw.sel ? "a skin" : "Default");
+    } else {
+        fighter_skins_set_slot(g_sw.slot, g_sw.fe, 0);
+        fprintf(stderr, "[SKINS] skin window: back (slot %d keeps the fighter's own look)\n", g_sw.slot);
+    }
+    return true;
 }
 
 bool take_exit_test_request()
@@ -6100,6 +6291,7 @@ bool draw_pages(ImVec2 display)
         draw_fighters(dl, f, pad, &chosen, &fighter);
         if (chosen) {
             recomp_settings_set("online", "fighter", fighter);
+            recomp_settings_set("online", "fighter_skin", S.pick_skin);     // build 85: READY's skin (netplay.c)
             if (S.ranked_pick && !room.in_room) {
                 ranked_search(fighter);
                 S.page = RANKED;
@@ -6112,7 +6304,10 @@ bool draw_pages(ImVec2 display)
                         if (room.players[i].slot == room.you) ready = room.players[i].ready;
                     netplay_lobby_ready(ready, fighter);
                 }
+                FighterSkin look;
+                bool skinned = S.pick_skin > 0 && fighter_skin_get(fighter, S.pick_skin, &look);
                 say((S.random_pick ? std::string("RANDOM: ") : std::string()) + fighter_label(fighter) +
+                    (skinned ? std::string(" (") + look.name + ")" : std::string()) +
                     (room.in_room && NETPLAY_IS_HILL(room.settings.mode) ? " it is, from your next fight." : " it is."));
                 S.page = HUB;
             }

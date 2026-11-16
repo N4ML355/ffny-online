@@ -57,6 +57,7 @@
 #include "pc_content.h"
 #include "pc_mods.h"
 #include "fight_hud.h"
+#include "fighter_skins.h"
 #include "start_countdown.h"
 #include "detmath/detmath.h"
 
@@ -109,6 +110,8 @@ int netplay_hill_watch_quiet(void) { return 0; }
 int netplay_last_match_key(char *out, int size) { if (size > 0) out[0] = 0; return 0; }
 void netplay_lobby_settings(const NetRoomSettings *s) { (void)s; }
 void netplay_lobby_ready(int r, int f) { (void)r; (void)f; }
+void netplay_lobby_ready_skin(int r, int f, int k) { (void)r; (void)f; (void)k; }
+int netplay_lobby_skins(void) { return 0; }
 void netplay_lobby_vote(int c) { (void)c; }
 void netplay_lobby_leave(void) {}
 void netplay_lobby_yield(void) {}
@@ -309,6 +312,8 @@ void netplay_crowd_update(void) { sub_00081170(); }
                                  * players of the community Android port where the relay allows it (setting
                                  * [online] crossplay_android, default off; docs/research/crossplay-optin.md) */
 #define CAPS_XPLAY_OPT (recomp_settings_get("online", "crossplay_android", 0) ? CAPS_XPLAY_ANDROID : 0u) /* sent only while on */
+#define CAPS_SKINS    4194304u  /* 1 << 22 (build 85), both ways: READY's third byte is the player's skin of a stock fighter,
+                                 * and START (WATCH, WATCHLATE) ends with the players' skins (src/hooks/fighter_skins.c) */
 #define CP_WAIT_MS    10000     /* START: how long to wait for a created fighter's missing record */
 #define CAPS_TRIES    5         /* CAPS every RETRY_MS; no answer after these: an older relay */
 #define WINNER_DRAW   0xFFu
@@ -892,6 +897,15 @@ static BOOL CALLBACK init_once(PINIT_ONCE o, PVOID p, PVOID *c)
     N.koth_winner = -1;
     N.koth_pick = -1;
     return TRUE;
+}
+
+/* What a player is shown for the relay: its region ("the US East server"), never our host and port;
+ * a custom address stays as typed. The real address stays in N.server_text, logs and reports. */
+static const char *server_shown(const char *address, char *buf, size_t size, int *ours)
+{
+    int k = netservers_display(address, buf, (int)size);
+    if (ours) *ours = k;
+    return buf;
 }
 
 static void set_status(const char *format, ...)
@@ -1547,8 +1561,9 @@ static void intro_update(void)
     if (!intro_window()) { g_intro_state = 0xFFFFFFFFu; return; }
     st = MEM32(G_LOGIC_STATE);
     if (N.watching && N.players >= 4) {
-        /* a watcher of a fight of four: its own pad reads on the fourth fighter's port until the first step
-         * (assign_input), so a face button pressed now can cut that fighter's intro short on this PC alone */
+        /* a watcher of a fight of four: until build 83 its own pad read on the fourth fighter's port until the
+         * first step, so a face button pressed now cut that fighter's intro short on this PC alone; since
+         * build 84 it is on no port (assign_input) and a press here is harmless (tests read the line) */
         static uint32_t told;
         XBOX_INPUT_STATE ls;
         int k, down = 0;
@@ -1557,7 +1572,7 @@ static void intro_update(void)
             for (k = 0; k < 8; k++) if (ls.Gamepad.bAnalogButtons[k] > 30) down = 1;
         if (down && told != N.match) {
             told = N.match;
-            fprintf(stderr, "[NETPLAY] watching: this PC's pad pressed during the intros (pre-fight state %d), on the fourth "
+            fprintf(stderr, "[NETPLAY] watching: this PC's pad pressed during the intros (pre-fight state %d), on no "
                     "fighter's port\n", (int)st);
         }
     }
@@ -1696,9 +1711,14 @@ static void assign_input(int on)
     unsigned mask = 0;
     int i, local = N.pos;
     if (!on) { xbox_HostInputSetNetplay(0, 0, 0, NULL); fight_input(); return; }
-    /* a spectator drives no fighter: its own pad goes on the first port no player uses (with four
-     * players the fourth, which the fight's entries override; spectator-mode.md 9) */
-    if (local < 0) local = N.players < 4 ? N.players : 3;
+    /* a spectator drives no fighter: its own pad goes on the first port no player uses. With four
+     * players it sits on the fourth port until the venue has loaded (the menus and the title before it
+     * still take its presses) and from then on no port at all (build 84, toolkit: local slot -1; the
+     * load point calls this again). Until build 83 it stayed on the fourth port, whose reads before the
+     * first step (the intros) were this PC's own presses instead of that fighter's: the watcher's picture
+     * parted from the fighters' (build 71), so fights of four were not watched live and an FFA rotation
+     * room's waiting players never saw a fight (Kirito, 2026-11-15). */
+    if (local < 0) local = N.players < 4 ? N.players : N.load_done ? -1 : 3;
     for (i = 0; i < N.players; i++)
         if (i != local) mask |= 1u << i;
     xbox_HostInputSetNetplayMulti(1, local, mask, remote_slot_state);
@@ -3534,12 +3554,12 @@ static int hill_watch_runs(uint32_t seed, const int *slots, int count)
         SPECTATOR_HERE() || N.hill_room_req)
         return 0;
     for (i = 0; i < count; i++) if (slots[i] == N.roomv.you) return 0;     /* a fighter gets START */
-    /* Build 71: not a fight of four (an FFA rotation room of five or more). This PC's pad has to sit on a
-     * port (the toolkit's netplay input has no "none"), and with four fighters every port is one: the
-     * watcher's own presses reached the fourth fighter's intro on its PC alone, and its picture went out of
-     * sync at step 120-240 in three of four five-copy runs (logs/dj/20261110-061005-online, -060501-online).
-     * Such a fight keeps the names screen until the toolkit can leave the pad off every port. */
-    if (count >= 4) return 0;
+    /* Builds 71-83 kept the names screen for a fight of four (an FFA rotation room of five or more): this
+     * PC's pad sat on the fourth fighter's port, its presses reached that fighter's intro here alone and the
+     * picture went out of sync (logs/dj/20261110-061005-online, -060501-online). Since build 84 a watcher's
+     * pad is on no port (assign_input), so a fight of four is watched live like the others.
+     * RECOMP_HILL_WATCH_FOUR=0 (tests): the old rule. */
+    if (count >= 4 && getenv("RECOMP_HILL_WATCH_FOUR") && atoi(getenv("RECOMP_HILL_WATCH_FOUR")) == 0) return 0;
     /* this PC's own fight still runs here (not decided yet); decided, on its results, the watch waits for the
      * menus (on_start_as defers it as it defers a START there) */
     if (N.match_live && !N.watching && !N.koth_results) return 0;
@@ -3736,6 +3756,8 @@ static void on_start_as(const uint8_t *b, int len, int watching)
     uint32_t seed;
     int count, i, j, slots[MAXP], fighters[MAXP], pos = -1, deferred, late = watching == 2, cpu = NETPLAY_CPU_HARD;
     int hill_watch = watching == 3, leaving = 0;
+    int skin_of_slot[ROOMSLOTS];
+    memset(skin_of_slot, 0, sizeof(skin_of_slot));
     if (len < 4) return;
     if (late || hill_watch) watching = 1;   /* T_WATCHLATE: watched like a WATCH, from the players' next fight */
     seed = get32(b);
@@ -3764,6 +3786,14 @@ static void on_start_as(const uint8_t *b, int len, int watching)
         if (r.i < r.n) {    /* build 67: the CPU fighters' level, after the created fighters (absent: Hard) */
             cpu = rd8(&r);
             if (r.bad || cpu > NETPLAY_CPU_EASY) return;
+        }
+        if (r.i < r.n) {    /* build 85: the players' skins, after the CPU level (relays answering CAPS_SKINS) */
+            int ns = rd8(&r), k;
+            for (k = 0; k < ns && !r.bad; k++) {
+                int s = rd8(&r), v = rd8(&r);
+                if (s < ROOMSLOTS && v <= FIGHTER_SKINS_PER) skin_of_slot[s] = v;
+            }
+            if (r.bad) return;
         }
         if (!(N.start_seed && seed == N.start_seed)) {
             EnterCriticalSection(&g_cs);
@@ -3798,6 +3828,9 @@ static void on_start_as(const uint8_t *b, int len, int watching)
         N.start_slots[i] = slots[i];
         m.fighter[i] = fighters[i];
         m.pad[i] = i;
+        /* build 85: the look START gives the player; every PC of the match has the same skins (the room's content
+         * print), and a skin this PC does not know plays the stock look (fighter_skins_set_slot) */
+        m.skin[i] = slots[i] < ROOMSLOTS ? skin_of_slot[slots[i]] : 0;
     }
     if (pos < 0 && !watching) return;
     if (watching) pos = -1;         /* spectator mode: no position, every player is remote */
@@ -3935,6 +3968,9 @@ static void on_start_as(const uint8_t *b, int len, int watching)
         int at = 0;
         for (i = 0; i < count && at < (int)sizeof(list) - 6; i++) at += snprintf(list + at, sizeof(list) - at, " %d", fighters[i]);
         fprintf(stderr, "[NETPLAY] START: fighters%s\n", list);
+        for (i = 0, at = 0; i < count && at < (int)sizeof(list) - 6; i++) at += snprintf(list + at, sizeof(list) - at, " %d", m.skin[i]);
+        for (i = 0; i < count && !m.skin[i]; i++) {}
+        if (i < count) fprintf(stderr, "[SKINS] START: skins%s\n", list);
     }
     if (late) {
         /* The players fight, or sit on their results, and choose Rematch there: no new START comes
@@ -4084,7 +4120,7 @@ static void on_packet(const uint8_t *b, int len)
             if (N.lobby) {
                 if (N.state == NETPLAY_CONNECTING) {
                     InterlockedExchange(&N.state, NETPLAY_LOBBY);
-                    set_status("In the lobby of %s.", N.server_text);
+                    { char shown[160]; set_status("In the lobby of %s.", server_shown(N.server_text, shown, sizeof shown, NULL)); }
                     pc_input_online_ports();    /* a room of four needs a controller in every port */
                     netplay_lobby_list(0xFF);
                     /* what this client supports; the network thread repeats it until the relay
@@ -4296,8 +4332,10 @@ static void on_packet(const uint8_t *b, int len)
             }
             if (code == 8 && N.pend_len && N.pend[5] == T_TPICK) text = "That stage can't be picked now.";
             if (code == 15) {   /* build 82: the room has other community packs; most often new ones are out */
-                text = pc_content_news(NULL, 0) > 0 ? NETPLAY_CONTENT_NEWS_LINE "."
-                     : NETPLAY_CONTENT_NEWS_LINE " (that room has other community packs than yours).";
+                char problem[512];      /* build 83: the last sync failed (the hub line says why; error[] is short) */
+                text = pc_content_problem(problem, sizeof(problem)) ? "Your community content is not up to date: start the game from the launcher again."
+                     : pc_content_news(NULL, 0) > 0 ? NETPLAY_CONTENT_NEWS_LINE "."
+                     : "That room has other community packs than yours: both need the same ones.";
                 if (N.lobby) pc_mods_check_start();     /* look again: the hub shows the news once it is known */
             }
             if (N.lobby && code == 12) {
@@ -4355,7 +4393,7 @@ static void on_packet(const uint8_t *b, int len)
                 N.started = GetTickCount64();
                 memset(&N.roomv, 0, sizeof(N.roomv));
                 InterlockedExchange(&N.state, NETPLAY_CONNECTING);
-                set_status("Reconnecting to %s...", N.server_text);
+                { char shown[160]; set_status("Reconnecting to %s...", server_shown(N.server_text, shown, sizeof shown, NULL)); }
                 break;
             }
             if (code == 11) {
@@ -4491,12 +4529,17 @@ static DWORD WINAPI net_thread(LPVOID unused)
         if (N.state == NETPLAY_CONNECTING) {
             if (now - N.hello_sent >= 500) { send_hello(); N.hello_sent = now; }
             if (now - N.started > 10000) {
+                char shown[160];
+                int ours;
+                server_shown(N.server_text, shown, sizeof shown, &ours);
                 InterlockedExchange(&N.state, NETPLAY_FAILED);
+                fprintf(stderr, "[NETPLAY] no answer from %s\n", N.server_text);
                 if (N.lobby)
-                    set_status("No answer from the server %s. It may be down, or an older server without the "
-                               "online hub (play by code still works there).", N.server_text);
+                    set_status("No answer from %s%s. It may be down, or an older server without the "
+                               "online hub (play by code still works there).", ours ? "" : "the server ", shown);
                 else
-                    set_status("No answer from the server %s. Check the address and that it is running.", N.server_text);
+                    set_status("No answer from %s%s. %s", ours ? "" : "the server ", shown,
+                               ours ? "It may be down." : "Check the address and that it is running.");
             }
         }
         if (N.have_token && N.state != NETPLAY_FAILED) {
@@ -4538,7 +4581,7 @@ static DWORD WINAPI net_thread(LPVOID unused)
                 memcpy(cb + n, N.token, 8); n += 8;
                 put32(cb + n, CAPS_KOTH | CAPS_CREATED | CAPS_SPECTATE | CAPS_STATS_ERR | CAPS_SPEC_REMATCH | CAPS_CHAT |
                               CAPS_CREW | CAPS_RB_MODES | CAPS_RB_PING | CAPS_RB_FRAMES | CAPS_SPEC_LATE | CAPS_CPULEVEL | CAPS_ROOMRULES |
-                              CAPS_TSET | CAPS_FFAROT | CAPS_RANDOM_VENUE | CAPS_HILL_WATCH | CAPS_HILL_READYUP | CAPS_XPLAY_OPT | CAPS_HILL_CREATED); n += 4;
+                              CAPS_TSET | CAPS_FFAROT | CAPS_RANDOM_VENUE | CAPS_HILL_WATCH | CAPS_HILL_READYUP | CAPS_SKINS | CAPS_XPLAY_OPT | CAPS_HILL_CREATED); n += 4;
                 send_raw(cb, n);
             } else {
                 N.relay_caps = 0;
@@ -4892,7 +4935,7 @@ static int start(const char *server, const char *name, int creating, const char 
     N.match_count = 0;
     disarm_crash_report();
     LeaveCriticalSection(&g_cs);
-    if (resolve(server)) { InterlockedExchange(&N.state, NETPLAY_FAILED); set_status("Cannot find the server %s.", server); return -1; }
+    if (resolve(server)) { InterlockedExchange(&N.state, NETPLAY_FAILED); { char shown[160]; int ours; server_shown(server, shown, sizeof shown, &ours); set_status("Cannot find %s%s.", ours ? "" : "the server ", shown); } return -1; }
     N.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (N.sock == INVALID_SOCKET) { InterlockedExchange(&N.state, NETPLAY_FAILED); set_status("No network socket."); return -1; }
     {   /* non-blocking: net_thread waits in select(), never in recv */
@@ -4902,7 +4945,7 @@ static int start(const char *server, const char *name, int creating, const char 
     N.stop = 0;
     N.hello_sent = 0;
     InterlockedExchange(&N.state, NETPLAY_CONNECTING);
-    set_status("Connecting to %s...", server);
+    { char shown[160]; set_status("Connecting to %s...", server_shown(server, shown, sizeof shown, NULL)); }
     N.thread = CreateThread(NULL, 0, net_thread, NULL, 0, NULL);
     if (N.thread) SetThreadPriority(N.thread, THREAD_PRIORITY_ABOVE_NORMAL);
     return N.thread ? 0 : -1;
@@ -5712,9 +5755,36 @@ void netplay_lobby_settings(const NetRoomSettings *settings)
 
 void netplay_lobby_ready(int ready, int fighter)
 {
-    uint8_t b[2] = { (uint8_t)(ready ? 1 : 0), (uint8_t)fighter };
+    /* build 85: the look the hub's last pick took with this fighter (its skin window), when this PC has that skin;
+     * RECOMP_TEST_SKIN=<n> (tests) plays skin n of any fighter that has one */
+    const char *test = getenv("RECOMP_TEST_SKIN");
+    int skin = 0;
+    if (fighter >= 0 && fighter < 98) {
+        if (test && *test) skin = atoi(test);
+        else if (recomp_settings_get("online", "fighter", -1) == fighter) skin = recomp_settings_get("online", "fighter_skin", 0);
+        if (skin && !fighter_skin_get(fighter, skin, NULL)) skin = 0;
+    }
+    netplay_lobby_ready_skin(ready, fighter, skin);
+}
+
+int netplay_lobby_skins(void)
+{
+    int on;
     InitOnceExecuteOnce(&g_once, init_once, NULL, NULL);
     EnterCriticalSection(&g_cs);
+    on = relay_has(CAPS_SKINS);
+    LeaveCriticalSection(&g_cs);
+    return on;
+}
+
+void netplay_lobby_ready_skin(int ready, int fighter, int skin)
+{
+    /* build 85: the skin as a third byte, only to a relay that answered CAPS_SKINS (an older one reads two) */
+    uint8_t b[3] = { (uint8_t)(ready ? 1 : 0), (uint8_t)fighter, (uint8_t)(skin > 0 && skin <= FIGHTER_SKINS_PER ? skin : 0) };
+    int len = 2;
+    InitOnceExecuteOnce(&g_once, init_once, NULL, NULL);
+    EnterCriticalSection(&g_cs);
+    if (relay_has(CAPS_SKINS) && fighter >= 0 && fighter < 0xFF) len = 3;
     if (N.roomv.in_room && NETPLAY_IS_HILL(N.roomv.settings.mode) && fighter >= 0 && fighter < 0xFF) {
         /* build 73: kept until the room has it (hill_pick_tick), and the fighter of this PC's next ready */
         if (N.koth_pick != fighter) N.koth_pick_tries = 0;
@@ -5722,7 +5792,8 @@ void netplay_lobby_ready(int ready, int fighter)
         N.koth_pick_sent = GetTickCount64();
     }
     LeaveCriticalSection(&g_cs);
-    request(T_READY, b, 2);
+    if (len == 3 && b[2]) fprintf(stderr, "[SKINS] READY: fighter %d, skin %d\n", fighter, b[2]);
+    request(T_READY, b, len);
 }
 
 void netplay_lobby_vote(int choice)
@@ -7345,6 +7416,7 @@ static void match_start_body(void)
      * the longest). */
     fight_input();
     N.load_done = 1;
+    if (N.watching && N.players >= 4 && N.lockstep) assign_input(1);  /* build 84: a watcher's pad off every port */
     fprintf(stderr, "[NETPLAY] match %08X starts in lockstep (%d players, delay %d); loaded in %.1f s since the START%s\n",
             N.match, N.players, N.delay, N.start_tick ? (GetTickCount64() - N.start_tick) / 1000.0 : -1.0,
             N.watching ? " (watching)" : "");

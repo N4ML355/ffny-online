@@ -45,8 +45,16 @@ static bool content_play_gate(bool pressed)
         g_content_play_skip = true;
         return false;
     }
+    // build 83: the last sync failed (a catalogue fetch or a download: the network, the PC's root store, its clock):
+    // one more try before the game starts, once per launcher run, whatever its age
+    static bool retried_failed;
+    bool failed_retry = false;
+    if (pressed && !retried_failed && !pcui::mod_busy()) {
+        PcContentSync last;
+        if (pc_content_sync_result(&last) && !strcmp(last.result, "failed")) failed_retry = retried_failed = true;
+    }
     if (pressed && !pcui::mod_busy() && content_sync_allowed() && !pcui::mod_recovery_needed() &&
-        (!g_content_synced_once || ui_ticks() - g_content_sync_started > 2 * 60000)) {
+        (!g_content_synced_once || failed_retry || ui_ticks() - g_content_sync_started > 2 * 60000)) {
         g_content_next_sync = 0;                    // a fresh look at the catalogue before the game starts
         g_content_synced_once = false;
         content_sync_tick();
@@ -288,7 +296,7 @@ static void content_dialog(ImVec2 o, float w, float h, float s)
                 ld->AddText(ImGui::GetFont(), 14 * s, ImVec2(ra.x + 30 * s, iy + 7 * s), col(ink), name);
                 float nx = ra.x + 30 * s + text_size(ImGui::GetFont(), 14 * s, name).x;
                 char sub[160];
-                snprintf(sub, sizeof sub, "  \xC2\xB7  %s%s", content_type_label(q.type),
+                snprintf(sub, sizeof sub, "  \xC2\xB7  %s%s", (q.skin ? "Skin" : content_type_label(q.type)),
                          !strcmp(q.type, "language") ? (on ? "  \xC2\xB7  choose it under Settings > General > Game language"
                                                            : "  \xC2\xB7  off: not offered as a game language") : "");
                 ld->AddText(ImGui::GetFont(), 12.5f * s, ImVec2(nx, iy + 8 * s), col(k_white, 0.55f), sub);
@@ -322,7 +330,7 @@ static void content_dialog(ImVec2 o, float w, float h, float s)
                     ImVec4(1, 1, 1, on ? 0.75f : 0.45f));
         ld->PopClipRect();
         char line[400];
-        snprintf(line, sizeof line, "%s  \xC2\xB7  %s  \xC2\xB7  v%s  \xC2\xB7  %.1f MB%s%s", content_type_label(p.type),
+        snprintf(line, sizeof line, "%s  \xC2\xB7  %s  \xC2\xB7  v%s  \xC2\xB7  %.1f MB%s%s", (p.skin ? "Skin" : content_type_label(p.type)),
                  content ? "always on, part of online matching" : "your choice", p.version, (double)p.bytes / 1048576.0,
                  p.authors[0] ? "  \xC2\xB7  by " : "", p.authors);
         ld->PushClipRect(ra, ImVec2(rb.x - 150 * s, rb.y), true);

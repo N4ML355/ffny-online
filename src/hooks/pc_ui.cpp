@@ -66,6 +66,7 @@ extern "C" {
 #include "netplay.h"
 #include "netplay_servers.h"
 #include "account.h"
+#include "account_pw.h"
 #include "social.h"
 #include "bug_report.h"
 #include "voice.h"
@@ -1786,7 +1787,13 @@ static void open_folder()
     pcui::open_path(pcui::folder_path(pcui::Folder::Settings), true);
 }
 
-// The optional FFNY Online account: sign-in with Discord (src/hooks/account.c).
+// Sign in without Discord's dialog (pc_launcher_password.inc, after the glass helpers below): mode 0 signs in,
+// 3 adds a password to a Discord account, 4 changes it.
+static void password_dialog_open(int mode);
+static void password_dialog_plain();
+
+// The optional FFNY Online account: sign-in with Discord (src/hooks/account.c), or without it (a username and
+// a password, pc_launcher_password.inc).
 static void page_account()
 {
     account_init();             // the launcher shows before main() loads the saved session
@@ -1796,8 +1803,17 @@ static void page_account()
     account_text(text, sizeof(text));
     float w = ImGui::GetFontSize() * 11;
     if (state == ACCOUNT_IN) {
-        ImGui::TextColored(k_gold, "Signed in with Discord: %s", text);
+        if (account_has_discord()) ImGui::TextColored(k_gold, "Signed in with Discord: %s", text);
+        else ImGui::TextColored(k_gold, "Signed in without Discord: %s", text);
         if (ImGui::Button("Sign out", ImVec2(w * 0.7f, 0))) account_sign_out();
+        ImGui::SameLine();
+        if (account_has_password() || account_password_offered(nullptr, nullptr, 0)) {
+            if (ImGui::Button(account_has_password() ? "Change password..." : "Add a password...", ImVec2(w, 0)))
+                password_dialog_open(account_has_password() ? 4 : 3);
+            ImGui::SetItemTooltip(account_has_password() ? "A new password for signing in without Discord."
+                                  : "A username and password for this account, to sign in without Discord too.");
+            ImGui::SameLine();
+        }
         ImGui::SameLine();
         if (ImGui::Button("Delete account...", ImVec2(w, 0))) ImGui::OpenPopup("Delete account");
         if (ImGui::BeginPopupModal("Delete account", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1827,7 +1843,12 @@ static void page_account()
 #if defined(_WIN32)
         if (ImGui::Button("Sign in with Discord", ImVec2(w, 0))) account_sign_in();
         ImGui::SameLine();
-        ImGui::TextDisabled("Optional: online you appear with your Discord name.");
+        if (account_password_offered(nullptr, nullptr, 0)) {
+            if (ImGui::Button("Sign in without Discord...", ImVec2(w * 1.3f, 0))) password_dialog_open(0);
+            ImGui::SetItemTooltip("An FFNY Online account with a username and a password: for players without Discord.");
+        } else {
+            ImGui::TextDisabled("Optional: online you appear with your Discord name.");
+        }
 #else
         ImGui::TextDisabled("Signing in with Discord comes to this system with online play.");
 #endif
@@ -1837,6 +1858,7 @@ static void page_account()
 #if defined(_WIN32)
     if (ImGui::SmallButton("Privacy")) ShellExecuteA(nullptr, "open", account_privacy_url(), nullptr, nullptr, SW_SHOWNORMAL);
 #endif
+    password_dialog_plain();
 }
 
 // Voice chat's settings, the microphone's level and what to know about it: the overlay's Online page
@@ -1890,7 +1912,8 @@ static void page_online(UiMode mode)
     {
         char shown[32];
         if (account_game_name(shown, sizeof(shown)))
-            ImGui::TextDisabled("Online you appear as %s, from your Discord account.", shown);
+            ImGui::TextDisabled(account_has_discord() ? "Online you appear as %s, from your Discord account."
+                                                      : "Online you appear as %s, your FFNY name.", shown);
     }
     discord_status_setting();
     settings_group("online", { "hill_watch", "name_tags", "perfect_banner", "delay_display" });
@@ -2497,11 +2520,19 @@ static void account_card(ImVec2 a, ImVec2 b, float s)
         card_line(dl, at, s, k_white, text, true);
         AccountNumbers n = account_numbers();
         char line[160];
-        if (!n.have) snprintf(line, sizeof(line), "Signed in with Discord");
-        else if (n.matches == 0) snprintf(line, sizeof(line), "No online matches yet  \xC2\xB7  signed in with Discord");
+        const char *how = account_has_discord() ? "signed in with Discord" : "no Discord";
+        if (!n.have) snprintf(line, sizeof(line), "%s", account_has_discord() ? "Signed in with Discord" : "Signed in without Discord");
+        else if (n.matches == 0) snprintf(line, sizeof(line), "No online matches yet  \xC2\xB7  %s", how);
         else if (n.rank > 0) snprintf(line, sizeof(line), "Rank %d  \xC2\xB7  %d wins  \xC2\xB7  %d losses", n.rank, n.wins, n.losses);
         else snprintf(line, sizeof(line), "%d wins  \xC2\xB7  %d losses", n.wins, n.losses);
+        bool options = account_has_password() || account_password_offered(nullptr, nullptr, 0);
+        dl->PushClipRect(a, ImVec2(options ? b.x - 118 * s : b.x, b.y), true);
         card_line(dl, ImVec2(at.x, at.y + 26 * s), s, ImVec4(0.80f, 0.80f, 0.82f, 1), line, false);
+        dl->PopClipRect();
+        // sign-in without Discord: add or change the password, link Discord (pc_launcher_password.inc)
+        if (options && glass_button("##pwopts", account_has_password() ? "Password..." : "Add password...",
+                                    ImVec2(b.x - 112 * s, b.y - 32 * s), ImVec2(94 * s, 22 * s), s, GLASS_PLAIN, nullptr, 12 * s))
+            password_dialog_open(account_has_password() ? 4 : 3);
         if (glass_button("##signout", "Sign out", ImVec2(b.x - 96 * s, a.y + 10 * s), ImVec2(78 * s, 24 * s), s,
                          GLASS_PLAIN, nullptr, 12.5f * s))
             account_sign_out();
@@ -2516,12 +2547,18 @@ static void account_card(ImVec2 a, ImVec2 b, float s)
         card_line(dl, at, s, ImVec4(0.75f, 0.75f, 0.78f, 1), "Checking your account...", false);
     } else {
 #if defined(_WIN32)
+        bool offered = account_password_offered(nullptr, nullptr, 0) != 0;
         card_line(dl, at, s, state == ACCOUNT_FAILED ? k_error : ImVec4(0.80f, 0.80f, 0.82f, 1),
-                  state == ACCOUNT_FAILED && text[0] ? text : "Sign in to play ranked and to fight under your Discord name.",
+                  state == ACCOUNT_FAILED && text[0] ? text : offered ? "Sign in to fight online and to play ranked."
+                  : "Sign in to play ranked and to fight under your Discord name.",
                   false, wrap);
-        if (glass_button("##signin", "Sign in with Discord", ImVec2(at.x, b.y - 40 * s), ImVec2(190 * s, 30 * s), s,
+        if (glass_button("##signin", "Sign in with Discord", ImVec2(at.x, b.y - 40 * s), ImVec2(offered ? 170 * s : 190 * s, 30 * s), s,
                          GLASS_DISCORD, bold_font(), 14 * s))
             account_sign_in();
+        // no Discord (blocked in some countries, or none): a username and a password (pc_launcher_password.inc)
+        if (offered && glass_button("##signin_pw", "Without Discord", ImVec2(at.x + 178 * s, b.y - 40 * s),
+                                    ImVec2(b.x - 20 * s - (at.x + 178 * s), 30 * s), s, GLASS_PLAIN, bold_font(), 13 * s))
+            password_dialog_open(0);
 #else
         card_line(dl, at, s, ImVec4(0.80f, 0.80f, 0.82f, 1), "Signing in with Discord comes to this system with online play.",
                   false, wrap);
@@ -3207,6 +3244,7 @@ static void settings_dialog(ImVec2 o, float w, float h, float s, int &tab, int &
 #include "pc_launcher_saves.inc"      // the Saves dialog, drawn with the glass above
 #include "pc_launcher_music.inc"      // the Music card and dialog (custom music), the same glass
 #include "pc_launcher_name.inc"       // the Account card's Change name dialog (the FFNY name)
+#include "pc_launcher_password.inc"   // sign in without Discord (username and password)
 #include "pc_launcher_graphics.inc"   // the Graphics card and dialog (Enhanced graphics), the same glass
 #include "pc_launcher_content.inc"    // the Content page (community packs from our signed catalogue)
 #include "pc_launcher_studio.inc"     // the FFNY Studio card (get, open and update Studio)
@@ -3365,6 +3403,7 @@ static UiResult draw_launcher(float x, float y, float width, float height)
     saves_dialog(origin, width, height, s);
     music_dialog(origin, width, height, s);
     name_dialog(origin, width, height, s);
+    password_dialog(origin, width, height, s);
     graphics_dialog(origin, width, height, s);
     content_dialog(origin, width, height, s);
     update_popup(result);
@@ -3667,6 +3706,7 @@ bool g_online = false;              // the overlay shows the online screens (the
 bool g_exit = false;                // the overlay shows the main menu's QUIT FFNY ONLINE? prompt
 std::atomic<bool> g_exit_req{false};    // ESC or a click on the EXIT chip (window thread)
 bool g_ms = false;                  // the overlay shows MILESTONES (the user-ID screen, the Story crib)
+bool g_skin = false;                // build 85: the overlay shows the skin window over a select screen
 std::atomic<bool> g_ms_req{false};      // a click on the MILESTONES chip (window thread)
 std::atomic<int> g_menu_eats_back{0};   // the title reads no BACK (VIEW) on the main menu (game thread)
 bool g_exit_view_down = true;       // the pad's VIEW was held last frame (true: a held one never opens it)
@@ -3785,7 +3825,7 @@ void set_open(bool open)
     if (g_open.load() == open) return;
     g_open = open;
     g_just_opened = open;
-    if (!open) g_online = g_exit = g_ms = false;
+    if (!open) g_online = g_exit = g_ms = g_skin = false;
     if (open) { g_hold_input = false; xbox_HostInputSetUiActive(1); }
     else g_hold_input = true;           // released in release_input_when_idle
 #if !defined(_WIN32)
@@ -4511,7 +4551,11 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         g_menu_eats_back = (online_screen::exit_wanted() || ms_here) && !ptt ? 1 : 0;
         bool req = g_exit_req.exchange(false);
         bool ms_req = g_ms_req.exchange(false);
-        if (!g_open.load() && !g_note.open && !toggled && online_screen::exit_wanted() &&
+        // build 85: a pick of a fighter with skins on the game's own select screen opens the skin window
+        if (!g_open.load() && !g_note.open && !toggled && online_screen::take_skin_window_request()) {
+            set_open(true);
+            g_skin = true;
+        } else if (!g_open.load() && !g_note.open && !toggled && online_screen::exit_wanted() &&
             (req || view_press || online_screen::take_exit_test_request())) {
             set_open(true);
             g_exit = true;
@@ -4621,6 +4665,8 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         if (!online_screen::draw(io.DisplaySize)) close_request = true;
     } else if (g_ms) {
         if (g_note.open ? false : !online_screen::draw_milestones(io.DisplaySize)) close_request = true;
+    } else if (g_skin) {
+        if (!g_note.open && online_screen::draw_skin_window(io.DisplaySize)) close_request = true;
     } else if (g_exit) {
         int answer = g_note.open ? 0 : online_screen::draw_exit_prompt(io.DisplaySize);
         if (answer == 2 && g_window) {

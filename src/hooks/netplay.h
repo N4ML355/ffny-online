@@ -74,7 +74,7 @@ typedef struct NetRoomSettings {
 #define NETPLAY_RULES_NO_CREATED 2      /* no created fighter */
 #define NETPLAY_RULES_STOCK      3      /* both: stock fighters, no banned tier */
 /* build 82: STANDARD ONLY, a bit on top of the others: the room's community content is off. New fighters
- * (IDs 100..127, named in NetRoom.blocked) and new venues (ONLINE_NEW_VENUE feIDs, left out of the pool) cannot
+ * (their places, new_fighter_places.h, named in NetRoom.blocked) and new venues (ONLINE_NEW_VENUE feIDs, left out of the pool) cannot
  * be picked; clothing packs stay (they only change looks). The relay enforces it. */
 #define NETPLAY_RULES_STANDARD   4
 #define NETPLAY_RULES_MASK       7      /* every FIGHTER RULES bit a build-82 relay takes */
@@ -82,7 +82,7 @@ typedef struct NetRoomSettings {
 #define NETPLAY_MAX_BLOCKED      128
 /* Build 82: what the game says when new community content is out (the hub, and a join the relay refused for other
  * community packs, ERROR 15). */
-#define NETPLAY_CONTENT_NEWS_LINE "New community content is out: restart FFNY Online to get it"
+#define NETPLAY_CONTENT_NEWS_LINE "New community content is out: close the game and start it from the launcher to get it"
 
 /* The CPU level of a 3-Way's or Free for All's CPU fighters (build 67): the game's own CPU difficulty
  * (its Battle mode's Easy / Normal / Hard), counted from the default down. Online CPU fighters always
@@ -366,6 +366,10 @@ int netplay_hill_watch_quiet(void);
 int netplay_last_match_key(char *out, int size);
 void netplay_lobby_settings(const NetRoomSettings *settings);   /* host only */
 void netplay_lobby_ready(int ready, int fighter);
+/* Build 85: READY with the player's skin of a stock fighter (fighter_skins.h; 0 Default), sent as READY's third byte
+ * to a relay that answered CAPS_SKINS (else as netplay_lobby_ready). netplay_lobby_skins: the relay takes skins. */
+void netplay_lobby_ready_skin(int ready, int fighter, int skin);
+int netplay_lobby_skins(void);
 void netplay_lobby_vote(int choice);
 void netplay_lobby_leave(void);
 /* King of the Hill: give up this PC's place in the line (to the back; a king gives up the crown).

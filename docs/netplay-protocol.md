@@ -382,10 +382,10 @@ by older relays.
 
 - `rules` bit 2 (`4`), on top of the FIGHTER RULES above: the host switched the room's **community
   content** off (CREATE A ROOM's COMMUNITY CONTENT row, offered only on a PC with community packs). New
-  fighters (front-end IDs 100..127, `type new-fighter` packs) and new venues (feIDs 28..63, Studio's
+  fighters (their places: front-end IDs 100..127 and, from build 85, 20 low IDs; `type new-fighter` packs) and new venues (feIDs 28..63, Studio's
   new-venue packs) cannot be picked; clothing packs stay (a clothing row has no number the fight reads:
   name, group, colours, price, display text, variants, order and shop type).
-- The relay enforces it: a `READY` with a new fighter plays Doc (`55`), `ROOM` names IDs 100..127 as
+- The relay enforces it: a `READY` with a new fighter plays Doc (`55`), `ROOM` names all 48 places as
   blocked, and the pool loses its new venues on `CREATE` and `SETTINGS` (a pool of only new venues
   becomes the mode's quick pool), so the candidates and a RANDOM win never draw one. A room without a
   content print (no community packs) drops new venues from its pool the same way.
@@ -491,7 +491,7 @@ silently (an unknown type), so no answer within about 2 s means "older relay or 
 | Type | Name | Direction | Body after the header |
 |---|---|---|---|
 | 0x24 | `STATUS` | client -> server | `nonce` u32, `build` 8 (the asker's fingerprint, zeros: any), 8 zero bytes (reserved) |
-| 0x24 | `STATUS` | server -> client | `nonce` u32 (the request's), `version` u8 (the protocol byte it speaks), `flags` u8 (bit 0 ranked queue, bit 1 King of the Hill, bit 2 rollback allowed), `online` u16 (registered clients, any build), `rooms` u16, `waiting` u16 (players of that build in public lobby-phase rooms with a free place: who a quick match meets), `idle` u16 (players of that build in the lobby, not in a room), `published` u32 (newest published build, 0 unknown), 2 zero bytes |
+| 0x24 | `STATUS` | server -> client | `nonce` u32 (the request's), `version` u8 (the protocol byte it speaks), `flags` u8 (bit 0 ranked queue, bit 1 King of the Hill, bit 2 rollback allowed, bit 3 `same` is set), `online` u16 (registered clients, any build), `rooms` u16, `waiting` u16 (players of that build in public lobby-phase rooms with a free place: who a quick match meets), `idle` u16 (players of that build in the lobby, not in a room), `published` u32 (newest published build, 0 unknown), `same` u16 (build 83 relays, flag bit 3: registered clients with exactly the asker's fingerprint, community content included; zero before) |
 
 - No token, no registration, no effect on any client (not even its idle timer). The request is
   exactly 26 bytes (reserved bytes zero, anything else is dropped) and the answer is 26 bytes, never
@@ -499,6 +499,10 @@ silently (an unknown type), so no answer within about 2 s means "older relay or 
 - Each source IP gets at most 4 answers a second; further requests are dropped silently. The
   per-IP message limit of the base protocol applies as well.
 - The summary log line counts the answers (`status=N` at its end).
+- Build 83: with `online - same` the game tells a player whose room list is empty that most players have
+  other community content (`online_screen.cpp`, `content_split_shown`). Games before build 83 read only the
+  first 18 body bytes. The relay also logs, once a minute, the sessions per build, platform and content print
+  and the ERROR 15 refusals (counts only).
 
 ## Public room list without a session (all servers)
 

@@ -6,6 +6,7 @@
  * loader, the file system and the netplay which packs are on. */
 #define _CRT_SECURE_NO_WARNINGS
 #include "pc_content.h"
+#include "new_fighter_places.h"
 #include "recomp_settings.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -200,6 +201,7 @@ int pc_content_list(PcContentPack *out, int max)
             if (n >= max || !valid_id(s + 6)) continue;
             cur = n++;
             memset(&out[cur], 0, sizeof out[cur]);
+            out[cur].skin_of = -1;
             snprintf(out[cur].id, sizeof out[cur].id, "%s", s + 6);
             continue;
         }
@@ -223,6 +225,8 @@ int pc_content_list(PcContentPack *out, int max)
             else if (!strcmp(k, "online_ok")) p->online_ok = atoi(v) == 1;
             CONTENT_TEXT(reviewed); CONTENT_TEXT(template_name);
             else if (!strcmp(k, "template_fe_id")) p->template_fe_id = atoi(v);
+            else if (!strcmp(k, "fighter_mode")) p->skin = !strcmp(v, "skin");
+            else if (!strcmp(k, "skin_of")) p->skin_of = atoi(v);
 #undef CONTENT_TEXT
         }
     }
@@ -266,10 +270,58 @@ uint32_t pc_content_print(void)
             for (c = parts[k]; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
             h = (h ^ (uint8_t)(k < 2 ? 0 : '\n')) * 16777619u;
         }
+        if (packs[i].skin) {    /* build 85: a skin is another look than the same pack as a fighter */
+            const char *c;
+            for (c = "skin\n"; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+        }
         any = 1;
     }
     if (!any) return 0;
     return h ? h : 1;
+}
+
+/* ---- build 85: skins ---- */
+
+int pc_content_skins(PcContentSkin *out, int max)
+{
+    static PcContentPack packs[PC_CONTENT_MAX];
+    char path[1024], line[1200];
+    const char *root = data_root();
+    FILE *f;
+    int n = 0, np, in_section = 0;
+    if (!root || max <= 0) return 0;
+    np = pc_content_list(packs, PC_CONTENT_MAX);
+    snprintf(path, sizeof path, "%s" HOST_SEP "mod-manager" HOST_SEP "content-files" HOST_SEP "files.ini", root);
+    if (!(f = fopen(path, "rb"))) return 0;
+    while (fgets(line, sizeof line, f) && n < max) {
+        char *s = trim(line), *fields[4], *q;
+        int k, i, ok = 0;
+        if (*s == '[') { in_section = !strcmp(s, "[content-files]"); continue; }
+        if (!in_section || strncmp(s, "skin=", 5)) continue;
+        q = s + 5;
+        for (k = 0; k < 4; k++) {
+            fields[k] = q;
+            q = k < 3 ? strchr(q, '|') : NULL;
+            if (k < 3 && !q) break;
+            if (q) *q++ = 0;
+        }
+        if (k < 4 || !valid_id(fields[0])) continue;
+        /* only a skin of an installed pack the composition applied, which content.ini calls a skin of the same
+         * template (a pack the launcher installed by hand never is one) */
+        for (i = 0; i < np; i++)
+            if (!strcmp(packs[i].id, fields[0]) && packs[i].skin && packs[i].applied &&
+                packs[i].skin_of == atoi(fields[1]))
+                ok = 1;
+        if (!ok || strlen(fields[2]) != 9 || strncmp(fields[2], "V2IP_7", 6)) continue;
+        memset(&out[n], 0, sizeof out[n]);
+        snprintf(out[n].id, sizeof out[n].id, "%s", fields[0]);
+        out[n].template_fe_id = atoi(fields[1]);
+        snprintf(out[n].model, sizeof out[n].model, "%s", fields[2]);
+        snprintf(out[n].name, sizeof out[n].name, "%s", trim(fields[3]));
+        n++;
+    }
+    fclose(f);
+    return n;
 }
 
 /* ---- build 82: new community content is out; the NEW badge ---- */
@@ -279,7 +331,7 @@ int pc_content_news(char *names, int size)
     char path[1024], line[1200];
     const char *root = data_root(), *test = getenv("RECOMP_TEST_CONTENT_NEWS");
     FILE *f;
-    int pending = 0, in_section = 0;
+    int pending = 0, revision = 0, in_section = 0;
     if (names && size > 0) names[0] = 0;
     if (test && *test) {
         if (names && size > 0) snprintf(names, (size_t)size, "%s", atoi(test) > 0 ? "Doc Nine | The Block" : "");
@@ -294,10 +346,198 @@ int pc_content_news(char *names, int size)
         if (!in_section || !(eq = strchr(s, '='))) continue;
         *eq = 0;
         if (!strcmp(s, "pending")) pending = atoi(eq + 1);
+        else if (!strcmp(s, "revision")) revision = atoi(eq + 1);
         else if (!strcmp(s, "names") && names && size > 0) snprintf(names, (size_t)size, "%s", eq + 1);
     }
     fclose(f);
+    /* build 84: news only for a catalogue newer than the one the installed packs were synced for; an older
+     * news.ini (a check before the last sync, a copied data folder) says nothing */
+    if (pending > 0 && revision <= pc_content_revision()) {
+        if (names && size > 0) names[0] = 0;
+        return 0;
+    }
     return pending > 0 ? pending : 0;
+}
+
+/* ---- build 83: the last sync and check (sync-result.ini, news.ini), for the log, F9 and the hub ---- */
+
+/* Calls fn(key, value) for each key of [section] in <data>/mod-manager/<file>; 0 when the file is not there. */
+static int read_ini_section(const char *file, const char *section, void (*fn)(void *, const char *, const char *),
+                            void *ctx)
+{
+    char path[1024], line[1400], head[64];
+    const char *root = data_root();
+    FILE *f;
+    int in_section = 0;
+    if (!root) return 0;
+    snprintf(path, sizeof path, "%s" HOST_SEP "mod-manager" HOST_SEP "%s", root, file);
+    snprintf(head, sizeof head, "[%s]", section);
+    if (!(f = content_fopen(path, "rb"))) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = trim(line), *eq;
+        if (*s == ';' || *s == '#') continue;
+        if (*s == '[') { in_section = !strcmp(s, head); continue; }
+        if (!in_section || !(eq = strchr(s, '='))) continue;
+        *eq = 0;
+        fn(ctx, trim(s), trim(eq + 1));
+    }
+    fclose(f);
+    return 1;
+}
+
+#define COPY_FIELD(dst, v) snprintf((dst), sizeof(dst), "%s", (v))
+
+static void sync_field(void *ctx, const char *k, const char *v)
+{
+    PcContentSync *s = (PcContentSync *)ctx;
+    if (!strcmp(k, "result")) COPY_FIELD(s->result, v);
+    else if (!strcmp(k, "kind")) COPY_FIELD(s->kind, v);
+    else if (!strcmp(k, "reason")) COPY_FIELD(s->reason, v);
+    else if (!strcmp(k, "time")) COPY_FIELD(s->time, v);
+    else if (!strcmp(k, "ids")) COPY_FIELD(s->ids, v);
+    else if (!strcmp(k, "skipped")) COPY_FIELD(s->skipped, v);
+    else if (!strcmp(k, "revision")) s->revision = atoi(v);
+    else if (!strcmp(k, "packs")) s->packs = atoi(v);
+}
+
+int pc_content_sync_result(PcContentSync *out)
+{
+    const char *test = getenv("RECOMP_TEST_CONTENT_SYNC");
+    memset(out, 0, sizeof *out);
+    if (test && *test) {
+        strcpy(out->result, "failed");
+        COPY_FIELD(out->kind, strstr(test, "clock") ? "clock" : "network");
+        COPY_FIELD(out->reason, test);
+        strcpy(out->time, "2026-11-15T12:00:00Z");
+        return 1;
+    }
+    return read_ini_section("sync-result.ini", "sync", sync_field, out);
+}
+
+static void news_field(void *ctx, const char *k, const char *v)
+{
+    PcContentNews *n = (PcContentNews *)ctx;
+    if (!strcmp(k, "revision")) n->revision = atoi(v);
+    else if (!strcmp(k, "pending")) n->pending = atoi(v);
+    else if (!strcmp(k, "checked")) COPY_FIELD(n->checked, v);
+    else if (!strcmp(k, "kind")) COPY_FIELD(n->kind, v);
+    else if (!strcmp(k, "error")) COPY_FIELD(n->error, v);
+}
+
+int pc_content_news_state(PcContentNews *out)
+{
+    memset(out, 0, sizeof *out);
+    out->known = read_ini_section("news.ini", "news", news_field, out);
+    if (!out->error[0]) out->kind[0] = 0;
+    return out->known;
+}
+
+static void revision_field(void *ctx, const char *k, const char *v)
+{
+    if (!strcmp(k, "revision")) *(int *)ctx = atoi(v);
+}
+
+int pc_content_revision(void)
+{
+    int revision = 0;
+    read_ini_section("content.ini", "content", revision_field, &revision);
+    return revision;
+}
+
+int pc_content_problem_text(const PcContentSync *sync, int have_sync, const PcContentNews *news, int installed,
+                            char *out, int size)
+{
+    const char *what = NULL, *reason = "", *kind = "";
+    if (!out || size <= 0) return 0;
+    out[0] = 0;
+    if (have_sync && sync && !strcmp(sync->result, "failed")) {
+        /* a good check after that sync saw no change to make: the content is current after all (the sync may
+         * have failed on its catalogue fetch while the cached catalogue was the newest) */
+        int fine = news && news->known && !news->error[0] && news->pending == 0 && news->revision <= installed &&
+                   strcmp(news->checked, sync->time) > 0;
+        if (!fine) { what = "updated"; reason = sync->reason; kind = sync->kind; }
+    }
+    if (!what && news && news->known && news->error[0]) { what = "checked"; reason = news->error; kind = news->kind; }
+    if (!what) return 0;
+    snprintf(out, (size_t)size, "Community content could not be %s%s%s. %s", what, *reason ? ": " : "", reason,
+             !strcmp(kind, "clock") ? PC_CONTENT_CLOCK_LINE : PC_CONTENT_FIX_LINE);
+    return 1;
+}
+
+/* Build 84: the sync installed packs but this run serves none of them (build 83's data folder with letters outside
+ * the ANSI code page was one way): set by pc_content_start, "" when all is well. */
+static char g_load_problem[400];
+
+int pc_content_problem(char *out, int size)
+{
+    PcContentSync sync;
+    PcContentNews news;
+    int have;
+    if (g_load_problem[0]) {
+        if (out && size > 0)
+            snprintf(out, (size_t)size, "Community content is installed but the game could not load it (%s). %s",
+                     g_load_problem, PC_CONTENT_LOAD_LINE);
+        return 1;
+    }
+    have = pc_content_sync_result(&sync);
+    pc_content_news_state(&news);
+    return pc_content_problem_text(&sync, have, &news, pc_content_revision(), out, size);
+}
+
+/* The print at the game's start (pc_content_log_header, main thread): the F9 report's thread names it without
+ * touching pc_content_print's buffer. The packs do not change while the game runs. */
+static uint32_t g_print_at_start;
+
+/* "revision 5, 1 pack (studio-d-mob-2), print F3245300"; any thread (its own pack buffer). */
+static void content_state(char *out, size_t size)
+{
+    PcContentPack *packs = (PcContentPack *)malloc(sizeof(PcContentPack) * PC_CONTENT_MAX);
+    char ids[1024] = "";
+    int n = packs ? pc_content_list(packs, PC_CONTENT_MAX) : 0, i, o = 0;
+    for (i = 0; i < n && o < (int)sizeof ids - 1; i++)
+        o += snprintf(ids + o, sizeof ids - (size_t)o, "%s%s%s", i ? ", " : "", packs[i].id,
+                      packs[i].composed && !packs[i].applied ? " (not applied)" : "");
+    free(packs);
+    snprintf(out, size, "revision %d, %d pack%s%s%s%s, print %08X", pc_content_revision(), n, n == 1 ? "" : "s",
+             n ? " (" : "", ids, n ? ")" : "", (unsigned)g_print_at_start);
+}
+
+static void sync_line(char *out, size_t size, const char *prefix)
+{
+    PcContentSync s;
+    if (!pc_content_sync_result(&s))
+        snprintf(out, size, "%sno sync result (a launcher before build 83 or never synced)", prefix);
+    else if (!strcmp(s.result, "ok"))
+        snprintf(out, size, "%slast sync ok, revision %d, %d pack%s%s%s (%s)", prefix, s.revision, s.packs,
+                 s.packs == 1 ? "" : "s", s.skipped[0] ? "; skipped for this build: " : "", s.skipped, s.time);
+    else
+        snprintf(out, size, "%slast sync %s: %s (%s; revision %d, %d pack%s, %s)", prefix,
+                 !strcmp(s.result, "cancelled") ? "CANCELLED (PLAY NOW)" : "FAILED", s.reason[0] ? s.reason : "?",
+                 s.kind[0] ? s.kind : "-", s.revision, s.packs, s.packs == 1 ? "" : "s", s.time);
+}
+
+void pc_content_log_header(void)
+{
+    char line[1400], state[1200];
+    g_print_at_start = pc_content_print();
+    sync_line(line, sizeof line, "");
+    content_state(state, sizeof state);
+    fprintf(stderr, "[CONTENT] %s\n[CONTENT] installed: %s\n", line, state);
+}
+
+void pc_content_report_line(void)
+{
+    char line[1400], state[1200], problem[512];
+    PcContentNews news;
+    sync_line(line, sizeof line, "");
+    content_state(state, sizeof state);
+    pc_content_news_state(&news);
+    fprintf(stderr, "[REPORT] content: %s; %s; check: %s", state, line,
+            !news.known ? "none yet" : news.error[0] ? "FAILED" : "ok");
+    if (news.known) fprintf(stderr, " (revision %d, %d pending%s%s, %s)", news.revision, news.pending,
+                            news.error[0] ? ", " : "", news.error, news.checked);
+    fprintf(stderr, "\n");
+    if (pc_content_problem(problem, sizeof problem)) fprintf(stderr, "[REPORT] content problem shown: %s\n", problem);
 }
 
 /* Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil). */
@@ -389,7 +629,7 @@ static void set_picked(const char *id)
 int pc_content_new_fighter(int fe_id)
 {
     int i;
-    if (fe_id < 100 || fe_id > 127) return 0;
+    if (!new_fighter_is_place(fe_id)) return 0;
     refresh_new();
     for (i = 0; i < g_new_count; i++) if (g_new[i].fighter == fe_id) return !picked(g_new[i].id);
     return 0;
@@ -407,7 +647,7 @@ int pc_content_new_venue(int fe_id)
 void pc_content_picked_fighter(int fe_id)
 {
     int i;
-    if (fe_id < 100 || fe_id > 127) return;
+    if (!new_fighter_is_place(fe_id)) return;
     refresh_new();
     for (i = 0; i < g_new_count; i++) if (g_new[i].fighter == fe_id) set_picked(g_new[i].id);
 }
@@ -617,10 +857,32 @@ void pc_content_start(const char *root)
         if (v && !strcmp(v, "0")) { fprintf(stderr, "[CONTENT] off for this run (RECOMP_CONTENT=0)\n"); return; }
     }
     n = pc_content_list(packs, PC_CONTENT_MAX);
-    if (!n) { fprintf(stderr, "[CONTENT] no community packs installed\n"); return; }
+    if (!n) {
+        PcContentSync last;
+        fprintf(stderr, "[CONTENT] no community packs installed\n");
+        /* build 84: the launcher's sync says it installed some, yet this run finds none (the data folder) */
+        if (!(tex_root && *tex_root) && pc_content_sync_result(&last) && last.packs > 0 &&
+            !getenv("RECOMP_TEST_CONTENT_SYNC")) {
+            snprintf(g_load_problem, sizeof g_load_problem, "the launcher installed %d pack%s, the game found none",
+                     last.packs, last.packs == 1 ? "" : "s");
+            fprintf(stderr, "[CONTENT] PROBLEM: the sync installed %d pack(s) (%s) but the game found none under %s: "
+                    "it goes online with another content set\n", last.packs, last.ids, root ? root : "(no data folder)");
+        }
+        return;
+    }
 #if !defined(DEFJAM_APP)
     /* fighter bodies, clothing, venues: the launcher composed them; a test texture root holds only its own */
-    if (!(tex_root && *tex_root)) serve_composed_files(root ? root : data_root());
+    if (!(tex_root && *tex_root)) {
+        int composed = 0;
+        serve_composed_files(root ? root : data_root());
+        for (i = 0; i < n; i++) composed += packs[i].composed && packs[i].applied;
+        if (composed && !g_file_count) {    /* build 84: synced and composed, but no community file served */
+            snprintf(g_load_problem, sizeof g_load_problem, "%d pack%s ready, 0 community files served", composed,
+                     composed == 1 ? "" : "s");
+            fprintf(stderr, "[CONTENT] PROBLEM: %d composed pack(s) but the game serves 0 community files from %s: "
+                    "it goes online with another content set\n", composed, root ? root : "(no data folder)");
+        }
+    }
 #endif
     old = getenv("RECOMP_TEXTURE_PACKS");
     for (i = 0; i < n; i++) {

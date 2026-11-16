@@ -88,6 +88,9 @@ static RecompSetting g_display_settings[] = {
       "Your name, shown to the other player.", "Player" },
     { "online", "fighter", RECOMP_SETTING_INT, 55, 0, 255, NULL, NULL, 0,
       "The fighter you pick in online rooms (its Battle-mode ID); chosen in the room." },
+    { "online", "fighter_skin", RECOMP_SETTING_INT, 0, 0, 15, NULL, NULL, 0,
+      "The community skin of that fighter you play online (0 its own look, 1.. its skins in the catalogue's order; "
+      "build 85); chosen in the room's CHOOSE A LOOK window." },
     { "online", "created", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
       "Which of your Story-mode fighters you play online when you pick a created fighter: its save, as "
       "user ID folder/name; chosen in the room. Empty: the newest.", "" },
@@ -1076,6 +1079,7 @@ int pc_settings_init(void)
      * import into it meanwhile), and the saves are backed up once a day (save-backups/). */
     if (have_root) saves_game_starts();
     graphics_mod_log_header();        /* [GRAPHICS]: the community pack on or off, for crash and F9 reports */
+    pc_content_log_header();          /* build 83 [CONTENT]: the last sync, the installed packs (crash and F9 reports) */
     custom_music_game_starts(have_root ? root : NULL);    /* the player's own songs, when there are any */
     /* What the picture runs with, for bug reports: input delay and frame pacing questions start here. */
     fprintf(stderr, "[SETTINGS] display: %s %dx%d, render scale %d, vsync %s, anti-aliasing %s, anisotropy %d, "

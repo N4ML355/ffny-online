@@ -35,6 +35,7 @@ pack's files to its own rebuild. A language pack whose translation does not take
 The game (src/hooks/pc_content.c) serves the listed files through the game-file redirect.
 """
 
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -44,10 +45,13 @@ import re
 import shutil
 import struct
 
-from ffnycontent import clothing, cpparts, delta, loc, newfighter, newvenue, viv
+from ffnycontent import clothing, cpparts, delta, fighterart, loc, newfighter, newvenue, viv
 
 SCHEMA = 1
-COMPOSER = 5                    # bump when the output for the same inputs changes
+COMPOSER = 8                    # bump when the output for the same inputs changes (8: row names just above the top)
+NEW_DAYS = 14                   # a new fighter's select thumbs carry NEW for this long after its review
+HUB_ART = ('online-art', 'fighters')    # <data>/online-art/fighters/<feID>.png: the online hub's portraits
+SKIN_ART = ('online-art', 'skins')      # <data>/online-art/skins/<pack id>.png: a skin's picture in the skin window
 TYPES = ('fighter-body', 'clothing', 'venue', 'new-fighter')
 OUT = 'content-files'
 LANG_DIR = 'lang'               # content-files/lang/<language pack>/<P>: the packs on top of that translation
@@ -385,11 +389,21 @@ def fighter_place(op, fe_id):
 
 
 MAX_VOICE_FILE = 1024 * 1024
+ART_FILES = (fighterart.BODY, fighterart.HEAD, fighterart.NAME)
 
 
 def pack_reader(folder):
-    """``read(path)`` of a pack's own files for its ops (a new fighter's voice clips, ``voice/<name>``)."""
+    """``read(path)`` of a pack's own files for its ops: a new fighter's voice clips (``voice/<name>``) and its
+    menu art (``art/body.png``, ``art/head.png``, ``art/name.png``; each optional: FileNotFoundError for one the
+    pack does not have, and the pictures it would fill stay the template's)."""
     def read(rel):
+        if rel in ART_FILES:
+            path = Path(folder).joinpath(*PurePosixPath(rel).parts)
+            if not path.is_file():
+                raise FileNotFoundError(rel)
+            if path.is_symlink() or path.stat().st_size > fighterart.ART_MAX_BYTES:
+                raise ComposeError('%s of the pack is too large' % rel)
+            return path.read_bytes()
         parts = PurePosixPath(rel).parts
         if (not isinstance(rel, str) or len(parts) != 2 or parts[0] != 'voice' or '..' in parts
                 or not re.fullmatch(r'[A-Za-z0-9_.\-]{1,64}', parts[1])):
@@ -401,9 +415,10 @@ def pack_reader(folder):
     return read
 
 
-def apply_new_fighter(work, op, fe_id, folder=None):
+def apply_new_fighter(work, op, fe_id, folder=None, new=False):
     pack = pack_reader(folder) if folder is not None else None
-    for where, rel, entry, data in newfighter.apply_op(FighterFiles(work), op, fighter_place(op, fe_id), pack=pack):
+    for where, rel, entry, data in newfighter.apply_op(FighterFiles(work), op, fighter_place(op, fe_id), pack=pack,
+                                                       new=new):
         if where == 'loose':
             work.set_loose(rel, data)
         elif where == 'replace':
@@ -414,9 +429,58 @@ def apply_new_fighter(work, op, fe_id, folder=None):
             work.add(rel, entry, data)
 
 
-def apply_pack(work, folder, info, fe_id=None):
+def is_skin(p):
+    """A new-fighter pack the team accepted as a skin (the catalogue's ``fighter_mode``): an outfit of its template."""
+    return p.get('fighter_mode') == 'skin'
+
+
+def apply_skin(work, op, skin_of=None):
+    """A skin: a new-fighter pack the team accepted as an extra outfit of its template (same gameplay, new look).
+    It gets the model's own files (the pack's add entries), its entity, IntroExtro entry, camera banks and
+    animation tags, as a new fighter does, but no Character row, no place and no menu pictures, and none of the
+    op's gameplay or voice: the game swaps the template's model for this one at match start for a player who
+    picked the skin (src/hooks/fighter_skins.c). ``skin_of``: the template the catalogue names (it must be the
+    op's). Returns (template feID, model, name)."""
+    problems = newfighter.op_problems(op, allow_fe_id=True)
+    if problems:
+        raise newfighter.FighterError(problems[0])
+    template_fe_id, template, model = op['template_fe_id'], op['template_model'], op['model']
+    if skin_of is not None and skin_of != template_fe_id:
+        raise ComposeError('the catalogue names fighter %s as this skin\'s template, the pack %d' % (skin_of,
+                                                                                                 template_fe_id))
+    files = FighterFiles(work)
+    rows = {r['fe_id']: r for r in newfighter.characters(files.current(newfighter.SOD_PATH))}
+    if template_fe_id not in rows or rows[template_fe_id]['model'].upper() != template.upper():
+        raise newfighter.FighterError('%s is not fighter %d of your game' % (template, template_fe_id))
+    if any(r['model'].upper() == model.upper() for r in rows.values()):
+        raise newfighter.FighterError('the model %s is another fighter\'s already' % model)
+    work.set_loose(newfighter.ENTITY_XML, newfighter.add_entity(files.current(newfighter.ENTITY_XML), template, model))
+    nis = next((n for n in files.names(newfighter.NIS_ARCHIVE) if n.lower() == newfighter.INTRO_EXTRO.lower()), None)
+    if nis is None:
+        raise newfighter.FighterError('%s has no %s' % (newfighter.NIS_ARCHIVE, newfighter.INTRO_EXTRO))
+    work.replace(newfighter.NIS_ARCHIVE, nis, newfighter.add_taunt(files.current(newfighter.NIS_ARCHIVE, nis),
+                                                                    template, model))
+    banks = newfighter.model_banks(newfighter._View(files, newfighter.BANK_ARCHIVE), template, model)
+    if len(banks) != 2:
+        raise newfighter.FighterError('the camera banks of %s are missing, or %s has its own already' % (template,
+                                                                                                         model))
+    for name, data in banks:
+        if work.exists(newfighter.BANK_ARCHIVE, name):
+            raise ComposeError('%s|%s exists already' % (newfighter.BANK_ARCHIVE, name))
+        work.add(newfighter.BANK_ARCHIVE, name, data)
+    try:
+        tags = files.current(newfighter.ANIM_TAGS)
+    except (KeyError, OSError):
+        tags = None
+    if tags is not None:
+        work.set_loose(newfighter.ANIM_TAGS, newfighter.add_anim_tags(tags, template, model))
+    return template_fe_id, model, op['name']
+
+
+def apply_pack(work, folder, info, fe_id=None, new=False, skin=False, skin_of=None):
     """One pack's ops (first, on the files as the earlier packs left them) and entries; raises on any failure.
-    ``fe_id``: a new-fighter pack's place from the signed catalogue."""
+    ``fe_id``: a new-fighter pack's place from the signed catalogue; ``new``: its select thumbs carry NEW;
+    ``skin``: the team accepted the new fighter as a skin of its template (``skin_of``, ``apply_skin``)."""
     clothing_ops = [op for op in info.get('ops', []) if op['op'] in CLOTHING_OPS]
     if clothing_ops:
         tables = {}
@@ -450,8 +514,10 @@ def apply_pack(work, folder, info, fe_id=None):
         work.set_loose(newvenue.ENTITY_XML, entity_xml)
         work.set_loose(clothing.SOD_PATH, sod_blob)
     for op in info.get('ops', []):
-        if op['op'] == 'new-fighter':
-            apply_new_fighter(work, op, fe_id, folder)
+        if op['op'] == 'new-fighter' and skin:
+            apply_skin(work, op, skin_of)
+        elif op['op'] == 'new-fighter':
+            apply_new_fighter(work, op, fe_id, folder, new)
     for e in info.get('entries', []):
         rel, entry = e['archive'], e['entry']
         if entry and not work.bases.exists(rel):
@@ -539,10 +605,29 @@ def write_files(folder, work, only=None):
     return files
 
 
+def skins_of(packs):
+    """The applied skins in catalogue order: [(pack id, template feID, model, name)]. The game numbers the skins of
+    each template from 1 in this order (0 is the template's own look), the same on every PC with the same packs
+    (the content print), so the online START names a skin by that number."""
+    out = []
+    for p in packs:
+        if not is_skin(p):
+            continue
+        try:
+            ops = [op for op in read_install(p['folder']).get('ops', []) if op['op'] == 'new-fighter']
+        except PACK_ERRORS:
+            continue
+        if ops:
+            out.append((p['id'], ops[0]['template_fe_id'], ops[0]['model'], ops[0]['name']))
+    return out
+
+
 def write_files_ini(new, applied, skipped, off, files, lang_files, lang_skipped):
     lines = ['[content-files]', 'schema=%d' % SCHEMA, 'set=' + set_hash(applied, off),
              'applied=' + ','.join(p['id'] for p in applied),
              'skipped=' + '; '.join('%s: %s' % (i, clean(r)) for i, r in skipped)]
+    # skins (pc_content.c, fighter_skins.c): skin=<pack id>|<template feID>|<model>|<name in the game>
+    lines += ['skin=%s|%d|%s|%s' % (i, t, m, clean(n).replace('|', ' ')) for i, t, m, n in skins_of(applied)]
     lines += ['file=' + rel for rel in sorted(files, key=str.lower)]
     lines += ['lang=%s|%s' % (pack_id, rel) for pack_id, rel in sorted(lang_files, key=lambda x: (x[0], x[1].lower()))]
     if lang_skipped:
@@ -551,15 +636,75 @@ def write_files_ini(new, applied, skipped, off, files, lang_files, lang_skipped)
         f.write('\n'.join(lines) + '\n')
 
 
-def run_packs(bases, chosen, log):
-    """Apply ``chosen`` on ``bases`` in order: (work, applied, skipped)."""
+def new_fighter_op(folder):
+    """The new-fighter op of a pack folder's install.json, or None (none, or an unreadable file)."""
+    try:
+        return next((op for op in read_install(folder).get('ops', []) if op.get('op') == 'new-fighter'), None)
+    except PACK_ERRORS + (ComposeError,):
+        return None
+
+
+def settle_places(packs, reserved=(), log=print):
+    """One feID per new fighter, before composing. A community pack keeps its catalogue place (the account service
+    gives each its own; a second one on a place already given is left out). A player's own pack (``local``, FFNY
+    Studio's "Use in my game") keeps the place Studio chose while no community pack, no place of the signed
+    catalogue (``reserved``: a pack that is live but not synced yet) and no earlier own pack has it; else it moves
+    to the first free place in ``newfighter.PLACE_ORDER`` (100..123, the low places, 124..127), and with none
+    free it is left out. Changes ``packs`` in place: a moved pack's ``fighter_fe_id``, ``place_problem`` (the
+    sentence for the Content page) on one left out. Returns [(pack id, old place, new place)] of the moves."""
+    order = list(newfighter.PLACE_ORDER)
+    valid = set(order)
+    fighters = []
+    for p in packs:
+        op = new_fighter_op(p['folder']) if p.get('folder') else None
+        if op is not None:
+            place = p.get('fighter_fe_id') or op.get('fe_id')
+            fighters.append((p, place if isinstance(place, int) and not isinstance(place, bool) else None))
+    taken = {r for r in reserved if r in valid}
+    owner = {}
+    for p, place in fighters:
+        if p.get('local'):
+            continue
+        if place in owner:
+            p['place_problem'] = "its place %d is the pack %s's already" % (place, owner[place])
+            log('[compose] %s left out: %s' % (p['id'], p['place_problem']))
+        elif place is not None:
+            owner[place] = p['id']
+            taken.add(place)
+    moves = []
+    for p, place in fighters:
+        if not p.get('local'):
+            continue
+        if place in valid and place not in taken:
+            taken.add(place)
+            continue
+        free = next((f for f in order if f not in taken), None)
+        if free is None:
+            p['place_problem'] = ('every place for a new fighter is taken by the community fighters and your other '
+                                  'packs; switch one of your own packs off to make room')
+            log('[compose] %s left out: %s' % (p['id'], p['place_problem']))
+            continue
+        why = ('the community pack %s has %s now' % (owner[place], place) if place in owner else
+               'place %s is taken' % place if place is not None else 'it had no place')
+        log('[compose] %s: new fighter moved from place %s to %d (%s)' % (p['id'], place, free, why))
+        p['fighter_fe_id'] = free
+        taken.add(free)
+        moves.append((p['id'], place, free))
+    return moves
+
+
+def run_packs(bases, chosen, log, new=()):
+    """Apply ``chosen`` on ``bases`` in order: (work, applied, skipped). ``new``: the IDs of the new-fighter packs
+    whose thumbs carry NEW (``new_packs``)."""
     work = Work(bases)
     applied, skipped = [], []
     for p in chosen:
         snap = work.snapshot()
         try:
+            if p.get('place_problem'):
+                raise ComposeError(p['place_problem'])
             info = read_install(p['folder'])
-            apply_pack(work, p['folder'], info, p.get('fighter_fe_id'))
+            apply_pack(work, p['folder'], info, p.get('fighter_fe_id'), p['id'] in new, is_skin(p), p.get('skin_of'))
             applied.append(p)
         except PACK_ERRORS + (cpparts.PartsError, loc.LocError, newfighter.FighterError) as error:
             work.restore(snap)
@@ -569,14 +714,14 @@ def run_packs(bases, chosen, log):
     return work, applied, skipped
 
 
-def run_whole(bases, chosen, log):
+def run_whole(bases, chosen, log, new=()):
     """``run_packs``, with the mods of a pack of several mods (``bundle``) applied all or none: a pack with a
     skipped mod is left out whole and the rest applied again from the bases, until no such pack is left (each
     round leaves out at least one more). Returns (work, applied, skipped, used): ``used`` the packs applied on."""
     dropped, reasons = set(), {}
     while True:
         used = [p for p in chosen if p.get('bundle') not in dropped]
-        work, applied, skipped = run_packs(bases, used, log)
+        work, applied, skipped = run_packs(bases, used, log, new)
         failed = dict(skipped)
         broken = {p['bundle'] for p in used if p.get('bundle') and p['id'] in failed}
         if not broken:
@@ -593,14 +738,14 @@ def run_whole(bases, chosen, log):
     return work, applied, [(p['id'], reasons[p['id']]) for p in chosen if p['id'] in reasons], used
 
 
-def compose_language(lang, chosen, applied, touched, data, game, bases, new, tmp):
+def compose_language(lang, chosen, applied, touched, data, game, bases, new, tmp, fresh=()):
     """The same packs once more on top of the language pack's rebuilt files: the paths it covers among
     ``touched`` (those the packs changed) go to <new>/lang/<id>/. Returns the paths written ([]: no overlap)."""
     overlap = sorted(touched & lang['covered'])
     if not overlap:
         return []
     built = {key: build_language_file(lang, key, bases, tmp / lang['id']) for key in overlap}
-    work, again, _ = run_packs(Bases(data, game, built), chosen, lambda text: None)
+    work, again, _ = run_packs(Bases(data, game, built), chosen, lambda text: None, fresh)
     if [p['id'] for p in again] != [p['id'] for p in applied]:
         raise ComposeError('the packs do not apply the same way on its files')
     return write_files(new / LANG_DIR / lang['id'], work, only=set(built))
@@ -656,13 +801,120 @@ def read_files_ini(root):
     return result
 
 
-def inputs_key(game, packs, off, languages=()):
+def inputs_key(game, packs, off, languages=(), new=()):
     raw = json.dumps([COMPOSER, str(Path(game).resolve()),
                       [[p['id'], p['version'], p['content_sha256'], p.get('fighter_fe_id', 0)]
-                       + ([p['bundle']] if p.get('bundle') else []) for p in packs],
+                       + ([p['bundle']] if p.get('bundle') else []) + (['left out'] if p.get('place_problem') else [])
+                       + (['skin', p.get('skin_of')] if is_skin(p) else []) for p in packs],
                       sorted(off),
-                      [[lang['id'], lang['stamp']] for lang in languages]])
+                      [[lang['id'], lang['stamp']] for lang in languages],
+                      sorted(new)])
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def new_packs(packs, today=None):
+    """The IDs of the new-fighter packs (those with a place from the catalogue) whose version the team accepted
+    less than ``NEW_DAYS`` days ago (``reviewed``, the catalogue's date; ``today``: a UTC date, now when None).
+    Their select thumbs carry NEW; the set is part of the inputs key, so the files are composed again on the day
+    it changes. A date up to a day ahead still counts (the review's day against the player's clock)."""
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    out = set()
+    for p in packs:
+        try:
+            days = (today - datetime.date.fromisoformat(str(p.get('reviewed') or ''))).days
+        except ValueError:
+            continue
+        if p.get('fighter_fe_id') and -1 <= days < NEW_DAYS:
+            out.add(p['id'])
+    return out
+
+
+def hub_portraits(data, packs, template, known=()):
+    """<data>/online-art/fighters/<feID>.png (the online hub's portrait, like the stock ones ``scripts/
+    online-art.py`` writes) for each applied new fighter whose pack has body art; a new fighter's place's portrait
+    of no
+    applied pack is removed. ``template(entry)``: an entry of screens.viv (the template's team portrait gives the
+    tone; KeyError and the like: the stock cool tone). ``known``: the [feID, pack id] pairs written before for
+    the same inputs, not drawn again while their file is there. Returns the pairs there now."""
+    folder = Path(data).joinpath(*HUB_ART)
+    known = {(int(fe), str(pack_id)) for fe, pack_id in known}
+    there = []
+    for p in packs:
+        if is_skin(p):
+            continue                        # a skin has no place (skin_portraits)
+        try:
+            ops = [op for op in read_install(p['folder']).get('ops', []) if op['op'] == 'new-fighter']
+            if not ops:
+                continue
+            place = fighter_place(ops[0], p.get('fighter_fe_id'))
+            if not newfighter.is_place(place) or place in dict(there):
+                continue
+            path = folder / ('%d.png' % place)
+            if (place, p['id']) not in known or not path.is_file():
+                body = pack_reader(p['folder'])(fighterart.BODY)
+                try:
+                    team = template('screens/portrait/p_CT/p_CT_%d.big' % (ops[0]['template_fe_id'] + 1))
+                except PACK_ERRORS:
+                    team = None
+                picture = fighterart.hub_portrait(body, team)
+                folder.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(path.name + '.tmp')
+                tmp.write_bytes(picture)
+                os.replace(tmp, path)
+            there.append([place, p['id']])
+        except PACK_ERRORS:
+            continue                        # no body art, or art the composer refused: no portrait
+    keep = {place for place, _ in there}
+    for place in newfighter.PLACES:
+        path = folder / ('%d.png' % place)
+        if place not in keep and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return there
+
+
+def skin_portraits(data, packs, template, missing_only=False):
+    """<data>/online-art/skins/<pack id>.png, the picture of each applied skin whose pack has body art (made like a
+    new fighter's hub portrait, ``hub_portraits``), for the skin window of the select screens and the online hub; a
+    picture of no applied skin is removed. ``template(entry)`` as for ``hub_portraits``. ``missing_only``: draw only the pictures that are not
+    there (the inputs did not change). Returns the pack ids with a picture."""
+    folder = Path(data).joinpath(*SKIN_ART)
+    there = []
+    for p in packs:
+        if not is_skin(p):
+            continue
+        try:
+            ops = [op for op in read_install(p['folder']).get('ops', []) if op['op'] == 'new-fighter']
+            if not ops:
+                continue
+            path = folder / ('%s.png' % p['id'])
+            if missing_only and path.is_file():
+                there.append(p['id'])
+                continue
+            body = pack_reader(p['folder'])(fighterart.BODY)
+            try:
+                team = template('screens/portrait/p_CT/p_CT_%d.big' % (ops[0]['template_fe_id'] + 1))
+            except PACK_ERRORS:
+                team = None
+            picture = fighterart.hub_portrait(body, team)
+            if not path.is_file() or path.read_bytes() != picture:
+                folder.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(path.name + '.tmp')
+                tmp.write_bytes(picture)
+                os.replace(tmp, path)
+            there.append(p['id'])
+        except PACK_ERRORS:
+            continue                        # no body art, or art the composer refused: the window shows the name
+    if folder.is_dir():
+        for path in folder.glob('*.png'):
+            if path.stem not in there:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    return there
 
 
 def unchanged(root, state, key, data, game):
@@ -686,12 +938,14 @@ def unchanged(root, state, key, data, game):
             and all((out / LANG_DIR / i).joinpath(*PurePosixPath(f).parts).is_file() for i, f in files['lang']))
 
 
-def compose(data, game, packs, off=None, root=None, log=print, languages=None):
-    """Compose ``packs`` ([{id, version, content_sha256, kind, order, folder, fighter_fe_id, bundle,
+def compose(data, game, packs, off=None, root=None, log=print, languages=None, today=None, reserved=()):
+    """Compose ``packs`` ([{id, version, content_sha256, kind, order, folder, fighter_fe_id, reviewed, bundle,
     bundle_name}], every synced pack with an install.json; ``fighter_fe_id`` the catalogue's place of a new
-    fighter, ``bundle`` the pack of several mods it belongs to, applied all or none) for the player, and once more with each installed language pack (``languages``: the list
+    fighter, ``reviewed`` the catalogue's review date of the version (``new_packs``; ``today``: the UTC date it
+    is measured from, now when None), ``bundle`` the pack of several mods it belongs to, applied all or none) for the player, and once more with each installed language pack (``languages``: the list
     ``language_packs`` makes, found when None). Returns {applied, skipped, files, lang_files, lang_skipped,
-    unchanged}."""
+    unchanged}. ``reserved``: the signed catalogue's new-fighter places (settle_places); a player's own new
+    fighter whose place another one has moves (its pack dict's ``fighter_fe_id`` changes: the caller keeps it)."""
     data = Path(data)
     root = Path(root) if root else data / 'mod-manager'
     root.mkdir(parents=True, exist_ok=True)
@@ -700,19 +954,27 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None):
     packs = sorted(packs, key=lambda p: (p.get('order', 1 << 30), p['id']))
     switched = sorted(p['id'] for p in packs if p.get('kind') != 'content' and p['id'] in off)
     chosen = [p for p in packs if p['id'] not in switched]
+    settle_places(chosen, reserved, log)
     languages = language_packs(data, off, log) if languages is None else list(languages)
-    key = inputs_key(game, chosen, switched, languages)
+    fresh = new_packs(chosen, today)
+    key = inputs_key(game, chosen, switched, languages, fresh)
     state_path = root / STATE
     try:
         state = json.loads(state_path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         state = None
     if unchanged(root, state, key, data, game):
+        ids = set(state['applied'])
+        screens = Bases(data, game)
+        hub_portraits(data, [p for p in chosen if p['id'] in ids],
+                      lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), state.get('hub', []))
+        skin_portraits(data, [p for p in chosen if p['id'] in ids],
+                       lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), missing_only=True)
         return {'applied': state['applied'], 'skipped': [tuple(s) for s in state.get('skipped', [])],
                 'files': state.get('files', []), 'lang_files': [tuple(x) for x in state.get('lang_files', [])],
                 'lang_skipped': [tuple(s) for s in state.get('lang_skipped', [])], 'unchanged': True}
     bases = Bases(data, game)
-    work, applied, skipped, used = run_whole(bases, chosen, log)
+    work, applied, skipped, used = run_whole(bases, chosen, log, fresh)
     files, lang_files, lang_skipped = [], [], []
     if applied:
         new, tmp = root / (OUT + '.new'), root / (OUT + '.lang-tmp')
@@ -724,7 +986,7 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None):
         touched = set(work.loose) | set(work.archives)
         for lang in languages:
             try:
-                written = compose_language(lang, used, applied, touched, data, game, bases, new, tmp)
+                written = compose_language(lang, used, applied, touched, data, game, bases, new, tmp, fresh)
                 lang_files += [(lang['id'], rel) for rel in written]
             except PACK_ERRORS + (ComposeError, cpparts.PartsError, loc.LocError, langpack().PackError) as error:
                 lang_skipped.append((lang['id'], str(error)))
@@ -737,8 +999,10 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None):
         swap(root, new)
     else:
         remove_output(root)
+    hub = hub_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
+    skin_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
     state = {'schema': SCHEMA, 'key': key, 'bases': bases.seen, 'applied': [p['id'] for p in applied],
-             'skipped': skipped, 'files': files, 'lang_files': lang_files, 'lang_skipped': lang_skipped,
+             'skipped': skipped, 'files': files, 'lang_files': lang_files, 'lang_skipped': lang_skipped, 'hub': hub,
              'set': set_hash(applied, switched) if applied else ''}
     tmp = root / (STATE + '.tmp')
     tmp.write_text(json.dumps(state, sort_keys=True), encoding='utf-8')

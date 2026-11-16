@@ -112,6 +112,39 @@ def test_new_fighter_gameplay_is_written_into_its_row(tmp_path):
     assert got["applied"] == [] and got["skipped"]
 
 
+def test_new_fighter_at_a_low_place(tmp_path):
+    """Build 85: a place below 98 (newfighter.LOW_PLACES). Place 37 has an unused Crow 2's pictures in the retail
+    screens (thumb37, thumb37off, l_MS_37_*, 38_2p/3p): the new fighter's copies replace them; place 5 has none."""
+    pack = make_pack(tmp_path / "packs" / "doc-low", "V2IP_7L5A", "Doc Low")
+    other = make_pack(tmp_path / "packs" / "doc-five", "V2IP_7L6A", "Doc Five")
+    data = tmp_path / "data"
+    got = content_compose.compose(data, GAME, [record(pack, "doc-low", 1, 37), record(other, "doc-five", 2, 5)],
+                                  off=(), log=lambda t: None, languages=[])
+    assert got["applied"] == ["doc-low", "doc-five"] and not got["skipped"]
+    rows = nf.characters(composed(data, nf.SOD_PATH).read_bytes())
+    assert [(r["fe_id"], r["display"], r["core_id"], r["main"]) for r in rows[-2:]] == [(37, "Doc Low", 10, 1),
+                                                                                      (5, "Doc Five", 10, 1)]
+    assert sorted(r["fe_id"] for r in rows) == sorted([r["fe_id"] for r in rows[:-2]] + [37, 5])
+    stock = viv.Archive(str(GAME / nf.SCREENS_ARCHIVE))
+    screens = viv.Archive(str(composed(data, nf.SCREENS_ARCHIVE)))
+    for name in ("screens/thumbs/thumb37.big", "screens/thumbs/thumb37off.big", "screens/portrait/38_2p.big",
+                 "screens/portrait/l_MS_37_2p.big"):
+        assert stock.has(name) and screens.has(name)
+        assert screens.read(name) != stock.read(name), name      # the new fighter's, not Crow 2's
+        inner = viv.Archive(viv.unwrap(screens.read(name)))
+        assert all(e.name.lower().startswith(name.rsplit("/", 1)[1][:-4].lower()) for e in inner.entries)
+    assert screens.has("screens/thumbs/thumb5.big") and screens.has("screens/portrait/p_cf/p_cf_6_2p.big")
+    assert not stock.has("screens/thumbs/thumb5.big")
+
+
+def test_a_place_outside_the_list_is_refused(tmp_path):
+    for place in (98, 99, 40, 128, 4):
+        pack = make_pack(tmp_path / "packs" / ("p%d" % place), "V2IP_7P%dA" % (place % 10), "Doc P")
+        got = content_compose.compose(tmp_path / ("data%d" % place), GAME, [record(pack, "p", 1, place)], off=(),
+                                      log=lambda t: None, languages=[])
+        assert got["applied"] == [] and got["skipped"], place
+
+
 def test_same_packs_same_files_whatever_the_order_of_places(tmp_path):
     a = make_pack(tmp_path / "packs" / "doc-two", "V2IP_7K3A", "Doc Two")
     b = make_pack(tmp_path / "packs" / "blaze-x", "V2IP_7Q1A", "Doc Three")
@@ -160,7 +193,10 @@ def test_catalogue_place_field():
                                       "file_count": 1, "sha256": "0" * 64, "root": "doc-two"}}],
             "kind": "content", "type": "new-fighter", "order": 3, "fighter_fe_id": 100}
     mod_catalogue.validate_mod(dict(base))
+    for good in (5, 37, 97, 127):
+        mod_catalogue.validate_mod(dict(base, fighter_fe_id=good))
     for bad in (dict(base, fighter_fe_id=128), dict(base, fighter_fe_id="100"), dict(base, type="venue"),
+                dict(base, fighter_fe_id=98), dict(base, fighter_fe_id=40), dict(base, fighter_fe_id=4),
                 {k: v for k, v in base.items() if k != "fighter_fe_id"}):
         with pytest.raises(ValueError):
             mod_catalogue.validate_mod(bad)
@@ -173,3 +209,90 @@ def test_names():
     assert "at most 11" in nf.name_problems("Doctor Octopus")[0]
     assert nf.name_problems("doc") and nf.name_problems("") and nf.name_problems(" Doc 2")
     assert nf.NEW_MODEL.match(nf.model_for("studio-doc-two"))
+
+
+def test_own_fighter_on_a_community_place_moves(tmp_path):
+    """A player's own new fighter (FFNY Studio's "Use in my game") at a place a community fighter now has: the
+    composed database gets both, each on its own feID (jackboy66, 2026-11-15: a local naruto at 117 beside the
+    community naruto at 117 was left out)."""
+    community = make_pack(tmp_path / "packs" / "studio-naruto", "V2IP_7N1A", "Naruto")
+    local = make_pack(tmp_path / "packs" / "my-studio-naruto", "V2IP_7N2A", "Naruto Two")
+    data = tmp_path / "data"
+    own = dict(record(local, "my-studio-naruto", 1 << 20, 117), local=True)
+    got = content_compose.compose(data, GAME, [record(community, "studio-naruto", 1, 117), own], off=(),
+                                  log=lambda t: None, languages=[], reserved={117})
+    assert got["applied"] == ["studio-naruto", "my-studio-naruto"] and not got["skipped"]
+    rows = nf.characters(composed(data, nf.SOD_PATH).read_bytes())
+    fes = [r["fe_id"] for r in rows]
+    assert len(fes) == len(set(fes))                                  # never two fighters on one feID
+    assert [(r["fe_id"], r["display"]) for r in rows[-2:]] == [(117, "Naruto"), (100, "Naruto Two")]
+    assert own["fighter_fe_id"] == 100
+
+
+# -- build 85: skins (a new-fighter pack the team accepted as an extra outfit of its template) ----------------------
+
+def skin_record(folder, pack_id, order, skin_of=TEMPLATE):
+    return dict(record(folder, pack_id, order), fighter_mode="skin", skin_of=skin_of)
+
+
+def test_skin_is_composed_without_a_row_or_a_place(tmp_path):
+    pack = make_pack(tmp_path / "packs" / "doc-red", "V2IP_7R1A", "Red Doc")
+    other = make_pack(tmp_path / "packs" / "doc-blue", "V2IP_7B1A", "Blue Doc")
+    data = tmp_path / "data"
+    got = content_compose.compose(data, GAME, [skin_record(pack, "doc-red", 1), skin_record(other, "doc-blue", 2)],
+                                  off=(), log=lambda t: None, languages=[])
+    assert got["applied"] == ["doc-red", "doc-blue"] and not got["skipped"]
+    assert not composed(data, nf.SOD_PATH).exists()            # no Character row: djv2.sod stays the game's
+    assert not composed(data, nf.SCREENS_ARCHIVE).exists()     # and no menu pictures (no select cell)
+    v2ip = viv.Archive(str(composed(data, nf.MODEL_ARCHIVE)))
+    assert v2ip.has("V2IP_7R1A.o") and v2ip.has("V2IP_7B1A.xsh")
+    v2ta = viv.Archive(str(composed(data, nf.BANK_ARCHIVE)))
+    assert v2ta.has("CE_7R1A.viv") and v2ta.has("CI_7B1A.viv")
+    nis = viv.Archive(str(composed(data, nf.NIS_ARCHIVE)))
+    entry = next(n for n in nis.names() if n.lower() == nf.INTRO_EXTRO.lower())
+    assert b"V2IP_7R1A" in nis.read(entry) and b"V2IP_7B1A" in nis.read(entry)
+    ini = composed(data, "files.ini").read_text(encoding="utf-8")
+    # the game numbers a template's skins in this (catalogue) order: 1 Red Doc, 2 Blue Doc
+    assert ini.index("skin=doc-red|55|V2IP_7R1A|Red Doc") < ini.index("skin=doc-blue|55|V2IP_7B1A|Blue Doc")
+
+
+def test_the_same_pack_as_a_fighter_or_as_a_skin(tmp_path):
+    """The team decides the mode; the pack is the same bytes either way."""
+    pack = make_pack(tmp_path / "packs" / "doc-two", "V2IP_7K3A", "Doc Two")
+    as_fighter, as_skin = tmp_path / "f", tmp_path / "s"
+    content_compose.compose(as_fighter, GAME, [record(pack, "doc-two", 1, 110)], off=(), log=lambda t: None, languages=[])
+    content_compose.compose(as_skin, GAME, [skin_record(pack, "doc-two", 1)], off=(), log=lambda t: None, languages=[])
+    assert nf.characters(composed(as_fighter, nf.SOD_PATH).read_bytes())[-1]["fe_id"] == 110
+    assert not composed(as_skin, nf.SOD_PATH).exists()
+    assert "skin=" not in composed(as_fighter, "files.ini").read_text(encoding="utf-8")
+    assert "skin=doc-two|55|" in composed(as_skin, "files.ini").read_text(encoding="utf-8")
+    key = lambda p: content_compose.inputs_key(GAME, [p], [])
+    assert key(record(pack, "doc-two", 1)) != key(skin_record(pack, "doc-two", 1))
+
+
+def test_skin_of_another_template_is_skipped(tmp_path):
+    pack = make_pack(tmp_path / "packs" / "doc-red", "V2IP_7R1A", "Red Doc")
+    got = content_compose.compose(tmp_path / "data", GAME, [skin_record(pack, "doc-red", 1, skin_of=7)], off=(),
+                                  log=lambda t: None, languages=[])
+    assert got["applied"] == [] and got["skipped"][0][0] == "doc-red"
+
+
+def test_catalogue_skin_fields():
+    base = {"id": "doc-red", "name": "Red Doc", "description": "x", "authors": ["a"], "class": "original",
+            "licence": "x", "homepage": "https://play.defjam.online", "revoked_versions": [],
+            "versions": [{"version": "1.0.0", "channel": "stable", "min_recomp": "0.1.0", "capabilities": [],
+                          "reviewed": "2026-11-15", "depends": [], "conflicts": [], "load_after": [],
+                          "archive": {"urls": ["https://play.defjam.online/x.zip"], "size": 1, "unpacked_size": 1,
+                                      "file_count": 1, "sha256": "0" * 64, "root": "doc-red"}}],
+            "kind": "content", "type": "new-fighter", "order": 3, "fighter_mode": "skin", "skin_of": 7}
+    mod_catalogue.validate_mod(dict(base))
+    mod_catalogue.validate_mod(dict(base, skin_of=0))          # House is a template too
+    for bad in (dict(base, fighter_fe_id=100), dict(base, skin_of=81), dict(base, skin_of="7"),
+                dict(base, fighter_mode="fighter"), dict(base, type="venue"),
+                {k: v for k, v in base.items() if k != "skin_of"}):
+        with pytest.raises(ValueError):
+            mod_catalogue.validate_mod(bad)
+    # skins hold no place: two of them and a fighter in one catalogue
+    fighter = {k: v for k, v in dict(base, id="doc-two", fighter_fe_id=100).items() if k not in ("fighter_mode", "skin_of")}
+    mod_catalogue.build([dict(base), dict(base, id="doc-blue"), fighter], 1, "2026-11-15T00:00:00Z",
+                        "2026-12-15T00:00:00Z")

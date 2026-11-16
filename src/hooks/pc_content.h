@@ -40,7 +40,7 @@ typedef struct PcContentPack {
     int off;                /* a replacement the player switched off */
     int composed;           /* fighter-body, clothing, venue: install.json, composed by the launcher */
     int applied;            /* composed: content-files/files.ini lists it in applied */
-    int fighter_fe_id;      /* a new fighter's front-end ID (100..127), 0 none */
+    int fighter_fe_id;      /* a new fighter's front-end ID (its place, new_fighter_places.h), 0 none */
     int venue_fe_id;        /* build 82: a new venue's front-end ID (28..63), 0 none */
     char reviewed[16];      /* build 82: the day the team accepted this version, YYYY-MM-DD ("" unknown) */
     int local;              /* the player's own pack (FFNY Studio's "Use in my game", local.json): switchable,
@@ -48,7 +48,22 @@ typedef struct PcContentPack {
     int online_ok;          /* local: it only changes how things look (textures), so it may stay on online */
     int template_fe_id;     /* build 83: a new fighter's template (its spot on the select screen), 0 none */
     char template_name[48]; /* ... and that fighter's name ("D-Mob"), "" unknown */
+    int skin;               /* build 85: a new fighter the team accepted as a skin (fighter_mode=skin) */
+    int skin_of;            /* ... the stock fighter it is an outfit of (its front-end ID), -1 none */
 } PcContentPack;
+
+/* Build 85, skins: a new-fighter pack the team accepted as an extra outfit of a stock fighter (same gameplay, new
+ * look; no place, no Character row). The launcher composed its model files and lists it in content-files/files.ini
+ * ("skin=<pack id>|<template feID>|<model>|<name>"), in catalogue order: the skins of one template are numbered
+ * from 1 in that order (0 is the template's own look), the same on every PC with the same content print. */
+#define PC_SKIN_MAX 64
+typedef struct PcContentSkin {
+    char id[96];            /* the pack id */
+    int template_fe_id;
+    char model[16];         /* V2IP_7xxA */
+    char name[48];          /* the name in the game */
+} PcContentSkin;
+int pc_content_skins(PcContentSkin *out, int max);
 
 /* The installed catalogue packs in catalogue order (re-read on every call; content.ini is small).
  * Returns the count (at most max). */
@@ -101,7 +116,50 @@ int pc_content_file(const char *game_path, char *out, int size);
  * (" | " between, may be NULL). RECOMP_TEST_CONTENT_NEWS=<n> fakes n (tests and screenshots). */
 int pc_content_news(char *names, int size);
 
-/* Build 82, the hub's NEW badge: a new fighter (front-end ID 100..127) or new venue (feID 28..63) from a pack the
+/* Build 83: why a PC can lack a pack everyone else has. The launcher's sync writes the last outcome to
+ * <data>/mod-manager/sync-result.ini and a failed `mods.py check` writes error= into news.ini (setup/mods.py);
+ * the game logs both at its start ("[CONTENT] last sync ok, revision 5, 1 pack" / "[CONTENT] last sync FAILED:
+ * <reason>"), puts them into the F9 report and tells the player in the online hub. */
+typedef struct PcContentSync {
+    char result[16];        /* "ok" | "failed" | "cancelled"; "" no sync-result.ini (a launcher before build 83) */
+    char kind[16];          /* "clock" | "network" | "disk" | "catalogue" | "pack" ("" when ok) */
+    char reason[320];       /* plain words */
+    char time[24];          /* UTC, YYYY-MM-DDTHH:MM:SSZ */
+    char ids[512];          /* the synced packs, comma-separated */
+    char skipped[256];      /* packs this launcher cannot take yet (a newer build) */
+    int revision;           /* the catalogue revision content.ini was written for */
+    int packs;
+} PcContentSync;
+typedef struct PcContentNews {
+    int known;              /* news.ini was read */
+    int revision;           /* the catalogue revision the last good check saw, 0 none */
+    int pending;            /* pack changes a sync would make */
+    char checked[24];       /* UTC of the last check, good or failed */
+    char kind[16];          /* the last check failed: as PcContentSync.kind; "" it worked */
+    char error[320];
+} PcContentNews;
+/* 1 when sync-result.ini was read. RECOMP_TEST_CONTENT_SYNC=<reason> fakes a failed sync (screenshots). */
+int pc_content_sync_result(PcContentSync *out);
+/* 1 when news.ini was read. */
+int pc_content_news_state(PcContentNews *out);
+/* The catalogue revision content.ini was written for (0 none). */
+int pc_content_revision(void);
+/* The hub's plain line for a content problem, from these three: a failed sync (unless a later good check this
+ * session saw nothing to change), else a failed check. 0 and "" when there is none. */
+int pc_content_problem_text(const PcContentSync *sync, int have_sync, const PcContentNews *news, int installed,
+                            char *out, int size);
+/* The same from the files (cheap enough for every few seconds). */
+int pc_content_problem(char *out, int size);
+/* Game start and F9: the content state as log lines ("[CONTENT] ..." / "[REPORT] content: ..."). */
+void pc_content_log_header(void);
+void pc_content_report_line(void);
+#define PC_CONTENT_FIX_LINE "Close the game and start it from the launcher, or check your internet and clock."
+#define PC_CONTENT_LOAD_LINE "Close the game and start it from the launcher; if it stays, press F9 to send a report."
+#define PC_CONTENT_CLOCK_LINE "Set the date and time to automatic in Windows, then start the game from the launcher."
+/* The room list is empty while many are online on other content (the relay's STATUS Same, build 83). */
+#define PC_CONTENT_SPLIT_LINE "Players with different community content can't see your rooms: close the game and start it from the launcher to update"
+
+/* Build 82, the hub's NEW badge: a new fighter (its place, new_fighter_places.h) or new venue (feID 28..63) from a pack the
  * team accepted less than PC_CONTENT_NEW_DAYS days ago, which this player has not picked yet. picked: the player
  * picked it (READY with the fighter, a vote for the venue, a match on it); its badge goes. RECOMP_TEST_CONTENT_NEW=
  * all shows every new fighter and venue as new (screenshots). */

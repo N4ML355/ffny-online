@@ -33,11 +33,16 @@ import mod_catalogue as contract
 import content_compose
 
 # FFNY Online's own catalogue: the account service signs it with its content key when the team accepts a
-# pack (docs/content-packs.md); the launcher syncs it at every start ("sync"). index-v3.json lists everything,
-# also the mods of a pack of several mods (with "bundle" and "bundle_name"); index-v2.json is the same catalogue
-# without pack items, for launchers of build 79; index.json also leaves new fighters out, for launchers up to
-# build 78. The three share their revisions.
-CATALOGUE_URL = 'https://play.defjam.online/updates/content/index-v3.json'
+# pack (docs/content-packs.md); the launcher syncs it at every start ("sync"). index-v4.json lists everything,
+# also new fighters at the 20 low places (build 85, newfighter.LOW_PLACES; their versions need the capability
+# fighter-places-v2); index-v3.json is the same catalogue without those, for launchers of builds 80..84, whose
+# check refuses a place outside 100..127; index-v3.json and up list the mods of a pack of several mods (with
+# "bundle" and "bundle_name"); index-v2.json is without pack items, for launchers of build 79; index.json also
+# leaves new fighters out, for launchers up to build 78. All share their revisions. Build 85: index-v4.json also
+# lists the skins (new fighters the team accepted as an extra outfit of a stock fighter: "fighter_mode": "skin",
+# "skin_of", no place).
+CATALOGUE_URL = 'https://play.defjam.online/updates/content/index-v4.json'
+CATALOGUE_URL_V3 = 'https://play.defjam.online/updates/content/index-v3.json'
 CATALOGUE_URL_V2 = 'https://play.defjam.online/updates/content/index-v2.json'
 CATALOGUE_URL_V1 = 'https://play.defjam.online/updates/content/index.json'
 KEYS = Path(__file__).resolve().parents[1] / 'config/mods/catalogue-keys.json'
@@ -479,6 +484,17 @@ def fetch_small(url, limit):
         return data
 
 
+def fetch_index(url):
+    """(raw, signature, url) of a catalogue index. index-v4.json that the server does not have yet (404: an account
+    service from before build 85) falls back to index-v3.json, the same catalogue without fighters at low places."""
+    try:
+        return fetch_small(url, MAX_INDEX), fetch_small(url + '.sig', 64), url
+    except urllib.error.HTTPError as error:
+        if error.code != 404 or url != CATALOGUE_URL:
+            raise
+    return fetch_small(CATALOGUE_URL_V3, MAX_INDEX), fetch_small(CATALOGUE_URL_V3 + '.sig', 64), CATALOGUE_URL_V3
+
+
 def semver(value):
     match = contract.version(value.removeprefix('v'))
     pre = match[4]
@@ -550,7 +566,10 @@ def plain_reason(problems, skew=None):
         return 'disk', text[:300]
     if any(w in low for w in ('urlopen error', 'timed out', 'getaddrinfo', 'connection', 'unreachable',
                               'name or service', 'http error', 'unexpected catalogue response', 'ssl')):
-        return 'network', 'no connection to the content server (%s)' % text[:240]
+        inner = re.sub(r'^(Catalogue:\s*)+', '', text)
+        inner = re.sub(r'<urlopen error (.*)>', r'\1', inner)
+        inner = re.sub(r'\[(WinError|Errno) -?\d+\]\s*', '', inner).strip()
+        return 'network', 'no connection to the content server (%s)' % inner[:160]
     if text.startswith('Catalogue') or 'catalogue' in low.split(':', 1)[0]:
         return 'catalogue', text[:300]
     return 'pack', text[:300]
@@ -582,6 +601,7 @@ class Manager:
         self.message = ''
         self.prerelease = prerelease
         self.newer = {}         # build 83: raw sync problems -> plain words (a pack only a newer build takes)
+        self.notes = []         # build 84: what a sync did besides installing (an unowned folder adopted or moved aside)
 
     def cancelled(self):
         check(not (self.cancel_file and self.cancel_file.exists()), 'Operation cancelled; previous installation preserved')
@@ -606,8 +626,7 @@ class Manager:
     def refresh(self, url=CATALOGUE_URL):
         check(self.keys, 'Catalogue signing key has not been provisioned; local mods still work')
         self.progress('Checking project catalogue')
-        raw = fetch_small(url, MAX_INDEX)
-        signature = fetch_small(url + '.sig', 64)
+        raw, signature, url = fetch_index(url)
         previous = read_json(self.root / 'catalogue.json', {})
         # index.json, index-v2.json and index-v3.json share their revisions but not their bytes: the same revision
         # from another file is no change without a new revision (an older revision is still a rollback)
@@ -728,7 +747,8 @@ class Manager:
             if old:
                 check(self.unchanged(target, old), 'Managed mod has local edits/missing files; preserve them before replacing')
             else:
-                check(not target.exists() and not linked(target), 'A local folder already uses this mod ID; it will not be overwritten')
+                check(not target.exists() and not linked(target),
+                      'A local folder already uses this mod ID; it will not be overwritten (%s)' % target)
             check(not linked(backup), 'Unsafe rollback folder')
             if backup.exists():
                 check(old and old.get('previous') and self.unchanged(backup, old['previous']),
@@ -792,12 +812,17 @@ class Manager:
                                bytes=version['archive']['unpacked_size'])
                 if 'fighter_fe_id' in mod:
                     receipt.update(fighter_fe_id=mod['fighter_fe_id'])
+                if mod.get('fighter_mode') == 'skin':
+                    receipt.update(fighter_mode='skin', skin_of=mod['skin_of'])
                 if 'bundle' in mod:
                     # one mod of a pack of several: the pack is installed and removed as one unit; its mods at
                     # this catalogue revision tell an interrupted sync's half pack (drop_broken_bundles)
                     items = sorted(m['id'] for m in self.trusted()['mods'] if m.get('bundle') == mod['bundle'])
                     receipt.update(bundle=mod['bundle'], bundle_name=mod['bundle_name'], bundle_items=items)
             self.cancelled()
+            if synced and self.take_unowned(mod_id, receipt):
+                self.progress('Installed ' + mod['name'])
+                return
             self.progress('Installing verified package')
             self.commit(mod_id, stage, receipt)
             self.progress(('Installed ' + mod['name']) if synced else
@@ -805,6 +830,42 @@ class Manager:
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
+
+    def take_unowned(self, mod_id, receipt):
+        """Build 84, a catalogue pack's folder <data>/mods/<id> is there but state.json does not own it (a copy by
+        hand, or a sync cut short, e.g. by the certificate failures before build 83), which used to block the pack
+        for good ("A local folder already uses this mod ID"):
+          (a) its files are exactly the signed package's: adopted into state.json as installed (True);
+          (c) it has local.json (the player's own pack from FFNY Studio): never touched; refused with its path;
+          (b) anything else: moved aside, never deleted, to <data>/mod-manager/replaced/<id>-<UTC time>, and the
+              signed package is installed as usual (False). The move is logged and named on the Content page."""
+        target = self.mods / mod_id
+        if mod_id in self.state()['installed'] or not (target.exists() or linked(target)):
+            return False
+        check(not linked(target), 'the folder %s is a link, not a pack folder; remove the link to get this pack' % target)
+        check(not target.is_file(), 'a file %s is in the way of this pack; move it away to get the pack' % target)
+        check(not (target / LOCAL_FILE).exists(),
+              'your own pack in %s uses the same id as this community pack; it is kept (give it another id to get both)'
+              % target)
+        with file_lock(self.root / 'runtime.lock'):
+            if self.unchanged(target, receipt):
+                state = self.state()
+                state['installed'][mod_id] = receipt
+                json_bytes(state)
+                atomic_json(self.root / 'state.json', state)
+                self.note('%s: the folder %s already held this exact pack; taken over as installed' % (mod_id, target))
+                return True
+            replaced = safe_dir(self.root / 'replaced')
+            aside = replaced / ('%s-%s' % (mod_id, dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')))
+            check(not aside.exists(), 'Unsafe replaced folder')
+            durable_rename(target, aside)
+            self.note('%s: an old folder %s that was not the signed pack was moved to %s' % (mod_id, target, aside))
+        return False
+
+    def note(self, text):
+        """Build 84: one line of what a sync did besides installing, for the Content page and the launcher log."""
+        self.notes.append(text)
+        print(json.dumps(dict(event='log', message=text)), file=sys.stderr, flush=True)
 
     def bundle_members(self, mod_id):
         """The installed synced mods of the pack ``mod_id`` names (the pack's id or one of its mods), else []."""
@@ -893,11 +954,14 @@ class Manager:
         self.write_content(index['revision'])
         self.compose_quietly(problems)
         self.write_sync_result('failed' if problems else 'ok', problems, index['revision'])
+        self.settle_news(index['revision'])
         count = sum(1 for r in self.state()['installed'].values() if r.get('synced'))
         message = 'Community content up to date: %d pack(s)' % count if not done else \
             'Community content synced: %d change(s), %d pack(s) installed' % (done, count)
         if problems:
             message += '. Not synced: ' + '; '.join(plain.get(p, p) for p in problems)
+        if self.notes:
+            message += '. ' + '; '.join(self.notes)
         self.progress(message)
 
     def sync_packs(self, index, problems):
@@ -915,6 +979,8 @@ class Manager:
                 if (installed and installed.get('version') == version['version']
                         and installed.get('archive_sha256') == version['archive']['sha256']
                         and installed.get('fighter_fe_id') == mod.get('fighter_fe_id')
+                        and installed.get('fighter_mode') == mod.get('fighter_mode')
+                        and installed.get('skin_of') == mod.get('skin_of')
                         and installed.get('bundle') == mod.get('bundle')
                         and installed.get('bundle_name') == mod.get('bundle_name')):
                     continue
@@ -1000,13 +1066,17 @@ class Manager:
     def composed_packs(self):
         """Every synced pack with an install.json, for content_compose."""
         out = []
+        reviewed = self.reviewed_dates()
         for mod_id, r in self.state()['installed'].items():
             contract.slug(mod_id)
             folder = self.mods / mod_id
             if r.get('synced') and not linked(folder) and (folder / 'install.json').is_file():
+                # reviewed: the day the team accepted this version (a new fighter's thumbs carry NEW for a while)
                 pack = dict(id=mod_id, version=r.get('version', ''), content_sha256=r.get('content_sha256', ''),
                             kind=r.get('kind', 'replacement'), order=r.get('order', 0), folder=folder,
-                            fighter_fe_id=r.get('fighter_fe_id', 0))
+                            fighter_fe_id=r.get('fighter_fe_id', 0),
+                            fighter_mode=r.get('fighter_mode', ''), skin_of=r.get('skin_of'),
+                            reviewed=reviewed.get((mod_id, r.get('version')), ''))
                 if r.get('bundle'):
                     # content_compose applies a pack of several mods whole or not at all
                     pack.update(bundle=r['bundle'], bundle_name=r.get('bundle_name', r['bundle']))
@@ -1044,14 +1114,31 @@ class Manager:
                             composed=(folder / 'install.json').is_file(), online_ok=local_online_safe(folder)))
         return out
 
+    def catalogue_places(self):
+        """The new-fighter places of the cached signed catalogue (a live pack this PC has not synced yet holds its
+        place too); empty when there is none or it does not verify."""
+        try:
+            return {m['fighter_fe_id'] for m in self.trusted()['mods'] if isinstance(m.get('fighter_fe_id'), int)}
+        except (ValueError, OSError, KeyError, TypeError):
+            return set()
+
     def compose(self):
         """Compose the fighter-body, clothing and venue packs into <data>/mod-manager/content-files (the game
-        serves them). Holds the runtime lock, so never while the game runs."""
+        serves them). Holds the runtime lock, so never while the game runs. A player's own new fighter whose place
+        a community fighter has now moves to a free one (content_compose.settle_places); its local.json keeps the
+        new place, so the next compose and the Content page agree."""
         with file_lock(self.root / 'runtime.lock'):
             self.progress('Preparing community content')
             off = content_compose.read_off(self.data)
             packs = self.composed_packs() + [p for p in self.local_packs() if p['composed'] and p['id'] not in off]
-            result = content_compose.compose(self.data, self.game, packs, root=self.root, log=lambda text: None)
+            moved = []
+            result = content_compose.compose(self.data, self.game, packs, root=self.root, log=moved.append,
+                                             reserved=self.catalogue_places())
+            if any([self.keep_local_place(p) for p in packs if p.get('local')]):
+                self.write_content(self.content_revision())     # the Content page and the game: the new place
+            for line in moved:
+                if 'moved from place' in line or 'left out' in line:
+                    self.progress(line.replace('[compose] ', ''))
         skipped = '; '.join('%s: %s' % s for s in result['skipped'] + result.get('lang_skipped', []))
         languages = sorted({i for i, _ in result.get('lang_files', [])})
         with_lang = ' (also with %s)' % ', '.join(languages) if languages else ''
@@ -1062,6 +1149,19 @@ class Manager:
                                                                                     len(result['files']), with_lang)
         self.progress(text + ('. Not applied: ' + skipped if skipped else ''))
         return result
+
+    def keep_local_place(self, p):
+        """Write a player's own pack's (new) place into its local.json when compose moved it; True when it did."""
+        path = Path(p['folder']) / LOCAL_FILE
+        try:
+            info = read_json(path, None, 64 * 1024)
+        except (ValueError, OSError):
+            return False
+        place = p.get('fighter_fe_id') or 0
+        if isinstance(info, dict) and place and info.get('fighter_fe_id') != place and not linked(path):
+            atomic_json(path, dict(info, fighter_fe_id=place))
+            return True
+        return False
 
     def compose_quietly(self, problems):
         try:
@@ -1083,6 +1183,9 @@ class Manager:
                         'description', 'fighter_fe_id', 'bundle', 'bundle_name'):
                 value = str(r.get(key, '')).replace('\n', ' ').replace('\r', ' ')[:500]
                 lines.append(key + '=' + value)
+            if r.get('fighter_mode') == 'skin':
+                # build 85: a skin, an extra outfit of the stock fighter skin_of (pc_content.c)
+                lines += ['fighter_mode=skin', 'skin_of=%d' % r.get('skin_of', -1)]
             # build 82: the day the team accepted this version (the hub's NEW badge) and a new venue's feID
             lines.append('reviewed=' + reviewed.get((mod_id, r.get('version')), ''))
             if (self.mods / mod_id / 'install.json').is_file():
@@ -1152,11 +1255,12 @@ class Manager:
             clean = lambda v: str(v).replace('\n', ' ').replace('\r', ' ')
             atomic_bytes(self.root / 'sync-result.ini', (
                 '; the last community content sync, written by setup/mods.py sync. Do not edit.\n[sync]\n'
-                'time=%s\nresult=%s\nkind=%s\nreason=%s\ndetail=%s\nskipped=%s\nrevision=%d\npacks=%d\nids=%s\n' % (
+                'time=%s\nresult=%s\nkind=%s\nreason=%s\ndetail=%s\nskipped=%s\nrevision=%d\npacks=%d\nids=%s\n'
+                'notes=%s\n' % (
                     dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), result, kind, clean(reason)[:300],
                     clean('; '.join(str(p) for p in problems))[:1000],
                     clean(', '.join(str(p).split(':', 1)[0] for p in skipped))[:500], revision, len(ids),
-                    clean(','.join(ids))[:1000])
+                    clean(','.join(ids))[:1000], clean('; '.join(getattr(self, 'notes', [])))[:1000])
             ).encode('utf-8'))
         except (ValueError, OSError, KeyError, TypeError):
             pass
@@ -1183,8 +1287,7 @@ class Manager:
         The last sync's revision (content.ini) counts as handled: a pack that failed there is not news again."""
         url = url or local_catalogue_url() or CATALOGUE_URL
         check(self.keys, 'Catalogue signing key has not been provisioned')
-        raw = fetch_small(url, MAX_INDEX)
-        signature = fetch_small(url + '.sig', 64)
+        raw, signature, url = fetch_index(url)
         previous = read_json(self.root / 'catalogue.json', {})
         index = verify_index(raw, signature, self.keys, previous.get('revision', 0), None, fresh=True)
         names = []
@@ -1211,6 +1314,19 @@ class Manager:
         ).encode('utf-8'))
         self.message = '%d community pack change(s) waiting' % len(names) if names else 'Community content up to date'
         return names
+
+    def settle_news(self, revision):
+        """Build 84: a finished sync for catalogue ``revision`` answers the news a check found up to that revision:
+        news.ini then says pending=0 (the game also ignores a news.ini not newer than content.ini)."""
+        old = configparser.ConfigParser(interpolation=None)
+        try:
+            old.read(self.root / 'news.ini', encoding='utf-8')
+            if not old.has_section('news') or int(old.get('news', 'revision', fallback='0')) > revision:
+                return
+            atomic_bytes(self.root / 'news.ini', ('[news]\nchecked=%s\nrevision=%d\npending=0\nnames=\n' % (
+                old.get('news', 'checked', fallback=''), revision)).encode('utf-8'))
+        except (OSError, ValueError, configparser.Error):
+            pass
 
     def write_news_failure(self, error):
         """Build 83: a check that failed says so in news.ini (error= and kind=, plain words), keeping the last good

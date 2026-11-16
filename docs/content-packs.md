@@ -95,14 +95,36 @@ template's, the model's symbols renamed) and whose one op `{"op": "new-fighter",
 the same text as Studio's `ffnystudio/newfighter.py`): a Character row in `djv2.sod` (the template's row with its
 own front-end ID, name and model; the template's coreID, so it fights like the template), the model's
 `entity.xml` entity, its `IntroExtro.xml` entry in `nis.viv`, its `CE_`/`CI_` camera banks in `v2ta.viv` and
-placeholder menu pictures in `screens.viv`. The front-end ID (100..127) is the **account service's place for the
-pack**, carried in the signed catalogue as the mod's `fighter_fe_id` and kept in the receipt: two players with the
+placeholder menu pictures in `screens.viv`. The front-end ID (one of 48 places: 100..127 and, from build 85, the 20
+low IDs 5 15 29 37 39 42 49 53 63 66 79 86 87 88 89 90 94 95 96 97; `newfighter.PLACES`, the game's
+`src/hooks/new_fighter_places.h`) is the **account service's place for the pack**, carried in the signed catalogue as the mod's `fighter_fe_id` and kept in the receipt: two players with the
 same packs build the same files whatever else they have. A synced new fighter without a place, or whose place or
 model is taken, is skipped. A pack installed by hand (or a Studio test) names its place in the op (`fe_id`).
 The catalogue with new fighters is `index-v2.json`; `index.json` is the same catalogue without them for launchers
 up to build 78, whose strict check would refuse the type and the key. Launchers of build 79 read `index-v2.json`;
-from the mod-bundles branch on the launcher reads `index-v3.json` (see "Packs of several mods" below). The three files share their
+from the mod-bundles branch on the launcher reads `index-v3.json` (see "Packs of several mods" below), and from build 85
+`index-v4.json`: the only one that lists a new fighter at a low place (its version has the capability
+`fighter-places-v2`, which the build-85 game offers, `src/hooks/pc_mods.cpp`); a launcher up to build 84 refuses a
+`fighter_fe_id` outside 100..127 and with it the whole catalogue. The account service gives low places only once
+build 85 is out (its `-fighter-places-switch`), in the order 100..123, the low places, 124..127. At place 37 the
+retail screens hold an unused Crow 2's pictures (`thumb37`, `l_MS_37_*`, `38_2p/3p`): the new fighter's copies
+replace them, and `scripts/apt-patch.py` takes Crow 2's baked grid picture out of frames 37 and 186. The files share their
 revisions: a cached revision of another file is not "changed without a new revision".
+
+**Skins (build 85).** At review the team decides whether a new-fighter pack goes live as its own character (as
+above) or as a **skin**: an extra outfit of its template, the same gameplay with a new look. A skin takes no place:
+its catalogue entry has `"fighter_mode": "skin"` and `"skin_of": <the template's front-end ID>` and no
+`fighter_fe_id`, and the place the submission held is free again. Only `index-v4.json` lists skins (launchers up to
+build 84 read `index-v3.json`, which leaves them out). The launcher composes a skin like a new fighter without the
+Character row and the menu pictures (`content_compose.apply_skin`: the model files, entity, IntroExtro entry, camera
+banks, animation tags) and lists it in `content-files/files.ini` as `skin=<pack id>|<template feID>|<model>|<name>`,
+in catalogue order; its picture for the skin window is `<data>/online-art/skins/<pack id>.png` (from `art/body.png`).
+`content.ini` marks it `fighter_mode=skin` and `skin_of=<feID>`, and the content print counts a skin with its mode.
+In the game (`src/hooks/fighter_skins.c`) picking the template opens the skin window (Default plus each skin), on the
+hub's CHOOSE FIGHTER and over the game's own select screens; the slot's model is swapped at match start, everything
+else is the template's. A template's skins are numbered from 1 in catalogue order; online the number travels as
+READY's third byte and in START's skins trailer (CAPS bit 22), so the opponent and spectators load the same model.
+CPU fighters and random picks play Default. The last skin per fighter is kept in `<data>/skin-choices.ini`.
 
 A relay before this branch refuses the longer HELLO; it is sent only by a PC with `content` packs, so the relay
 goes out first. The relay answers a code join between different content sets with ERROR 15 (14 is the relay's "client not supported").
@@ -212,3 +234,16 @@ FFNYStudio-<version>-windows-x64.zip
 Upload the zip first and the manifest and `.sig` last, so a launcher never sees a manifest whose zip is missing. A
 launcher offers **Update Studio** when `build` is higher than the installed one. Older zips can be removed once the
 new manifest is up.
+
+## Why a PC lacks a pack (build 83)
+
+- `setup/mods.py sync` writes `<data>/mod-manager/sync-result.ini` (`result` ok/failed/cancelled, `kind`
+  clock/network/disk/catalogue/pack, a plain `reason`, `revision`, `packs`, `ids`, `skipped` for packs this
+  build cannot take yet). A refresh that failed and fell back on the cached catalogue is `failed`.
+- `mods.py check` (the running game's news check) writes `error=` and `kind=` into `news.ini` when it fails.
+- The game logs both at its start (`[CONTENT] last sync ok, revision 5, 1 pack` / `[CONTENT] last sync FAILED:
+  <reason>`, `[CONTENT] installed: ...`), F9 adds `[REPORT] content: ...`, and the online hub shows one line.
+  Launcher PLAY syncs once more when the last sync failed.
+- Every HTTPS call of `mods.py` retries once with `config/mods/isrg-roots.pem` (ISRG Root X1 and X2) after a
+  certificate failure: Python's `ssl` reads the Windows root store as it is and never fetches a missing root as
+  WinHTTP does. Signatures are checked as before.
