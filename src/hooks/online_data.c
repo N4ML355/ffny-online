@@ -9,7 +9,9 @@
 #include <time.h>
 #include "online_data.h"
 #include "new_fighters.h"
+#include "fighter_banks.h"
 #include "pc_content.h"
+#include "rts.h"
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -168,13 +170,20 @@ static void load_fighters(void)
 }
 
 /* The arenas: a "NNx Name" display name with a front-end ID, not cut, not cinema only. */
+/* Build 86: the Run the Streets map is not a venue to vote on or pick: it stays out of every list (its name still
+ * answers online_venue_name). */
+static int g_rts_fe;
+static char g_rts_name[64];
+
 static void load_venues(void)
 {
+    RtsMap rts;
     /* build 82: the venue.xml the game reads, with the new venues of community packs in it (pc_content.c serves
      * the launcher's composed copy), else the dump's */
     char composed[1024], *text = pc_content_file("venue.xml", composed, sizeof composed) ? read_file(composed) : NULL, *p;
     if (!text) text = read_file("game/venue.xml");
     if (!text) return;
+    g_rts_fe = rts_map(&rts) ? rts.fe_id : 0;
     for (p = strstr(text, "<venue>"); p && g_venue_count < MAX_VENUES; p = strstr(p + 1, "<venue>")) {
         char *end = strstr(p, "</venue>"), disp[80], fe[16], *name, *paren;
         int fe_id, i, dup = 0;
@@ -192,6 +201,10 @@ static void load_venues(void)
         if (paren) {
             while (paren > name && paren[-1] == ' ') paren--;
             *paren = 0;
+        }
+        if (fe_id == g_rts_fe) {        /* the Run the Streets map: only its own mode plays it */
+            snprintf(g_rts_name, sizeof g_rts_name, "%s", name);
+            continue;
         }
         g_venues[g_venue_count].fe_id = fe_id;
         snprintf(g_venues[g_venue_count].name, sizeof(g_venues[0].name), "%s", name);
@@ -305,6 +318,10 @@ const char *online_fighter_name(int id)
         int n = online_new_fighters(&nf);
         for (i = 0; i < n; i++) if (nf[i].id == id) return nf[i].name;
     }
+    if (id >= FB_FIRST_LOGICAL) {   /* build 86: a community fighter beyond the places, by its number */
+        const FighterBanksEntry *e = fighter_banks_find(id);
+        if (e && e->name[0]) return e->name;
+    }
     /* 99 is a created fighter (NETPLAY_CREATED_FIGHTER): My Stats' last fights said "Fighter 99" (Discord, 2026-11-03) */
     if (id == 99) return "Created Fighter";
     next = (next + 1) % 4;
@@ -319,6 +336,7 @@ const char *online_venue_name(int fe_id)
     int i;
     load();
     for (i = 0; i < g_venue_count; i++) if (g_venues[i].fe_id == fe_id) return g_venues[i].name;
+    if (g_rts_fe && fe_id == g_rts_fe && g_rts_name[0]) return g_rts_name;
     next = (next + 1) % 4;
     snprintf(unknown[next], sizeof(unknown[0]), "Venue %d", fe_id);
     return unknown[next];

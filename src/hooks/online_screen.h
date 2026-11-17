@@ -38,10 +38,19 @@ bool exit_wanted();
  * draw_skin_window until it returns true (a look taken, or B: the fighter's own look). */
 bool take_skin_window_request();
 bool draw_skin_window(ImVec2 display);
+/* Community fighters beyond the places (community_ui.inc, fighter_banks.h): the select grid's MORE cell asks for
+ * the paged list; the overlay holds the game's input and draws it until it returns true (a fighter taken or B). */
+bool take_community_window_request();
+bool draw_community_window(ImVec2 display);
 bool exit_chip_at(float x, float y);
 bool take_exit_test_request();
 void exit_prompt_begin();
 int draw_exit_prompt(ImVec2 display);
+/* Build 86, UPDATE NOW (content_update.c): "NEW COMMUNITY CONTENT IS OUT" with UPDATE NOW and LATER, the overlay's
+ * popup on the main menu (main_menu: closes when the menu goes away) and inside the online screens (the hub's Y,
+ * a room refused for other packs). draw_update_prompt: 0 still open, 1 LATER, 2 UPDATE NOW taken, 3 the menu went. */
+void update_prompt_begin(const char *where);
+int draw_update_prompt(ImVec2 display, bool main_menu);
 
 /* MILESTONES (build 79, milestones_ui.inc): on the Battle user-ID screen and in the Story crib, a chip
  * (VIEW MILESTONES) that the pad's VIEW or a click opens into the profile's milestone progress. The
@@ -98,6 +107,15 @@ void draw_fight_hud(ImDrawList *dl, ImVec2 display);
 bool fight_chat_wanted();
 bool draw_fight_chat(ImDrawList *dl, ImVec2 display);
 bool fight_chat_typing();
+/* Build 86.1: whose the keyboard and mouse are with the online screens shut (pc_ui_window_message, rts_chat_route):
+ * RTS_CHAT_DOCK in a Run the Streets fight (its dock), RTS_CHAT_BAR for a spectator's bar, else RTS_CHAT_NONE. Read
+ * once a frame. fight_chat_at: a click at (x, y) window pixels lands on the dock's chip or window (as last drawn). */
+int fight_chat_keys();
+bool fight_chat_at(float x, float y);
+/* Run the Streets (rts_social_ui.inc): the chat bubbles and speaker icons over the fighters. rts_world_wanted() once a
+ * frame (with the overlay closed); draw_rts_world draws them, under the fight chat. Drawing only, no input. */
+bool rts_world_wanted();
+void draw_rts_world(ImDrawList *dl, ImVec2 display);
 
 /* Tests (RECOMP_TEST_QUICK_CHAT): the pad presses the quick-chat test makes, merged into the overlay's
  * own pad input (bit 0 the wheel's button, L3, or R3 when test_pad_r3; bit 1 A; the left stick -1..1). */

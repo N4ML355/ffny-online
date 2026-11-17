@@ -47,6 +47,15 @@ enum NetplayState {
 #define NETPLAY_MODE_FFAROT      0x42
 #define NETPLAY_FFAROT_SLOTS     8
 #define NETPLAY_IS_FFAROT(mode)  ((mode) == NETPLAY_MODE_FFAROT)
+/* Run the Streets (build 86, the open-world mode; closed test): a Free for All room of 2..4 on the Run the
+ * Streets map with Big Arena rules (respawn, knockout score, score and time limit). START carries match type 3
+ * (Free for All); the room's mode tells the game the rules. Only relays answering CAPS with NETPLAY_CAP_RTS list,
+ * create or join such rooms, and only for accounts the account service grants "run_the_streets"
+ * (GET /api/features); the relay checks that itself. Lockstep only for now. */
+#define NETPLAY_MODE_RTS         0x43
+#define NETPLAY_RTS_SLOTS        4
+#define NETPLAY_IS_RTS(mode)     ((mode) == NETPLAY_MODE_RTS)
+#define NETPLAY_CAP_RTS          16777216u  /* 1 << 24, both ways (bit 23 is the standard preference, CAPS_ORIGINAL) */
 /* A room with a line (HILL): King of the Hill or FFA rotation. */
 #define NETPLAY_IS_HILL(mode)    (NETPLAY_IS_KOTH(mode) || NETPLAY_IS_FFAROT(mode))
 
@@ -82,7 +91,8 @@ typedef struct NetRoomSettings {
 #define NETPLAY_MAX_BLOCKED      128
 /* Build 82: what the game says when new community content is out (the hub, and a join the relay refused for other
  * community packs, ERROR 15). */
-#define NETPLAY_CONTENT_NEWS_LINE "New community content is out: close the game and start it from the launcher to get it"
+/* build 86: UPDATE NOW (content_update.c) closes the game, gets the content and starts it again */
+#define NETPLAY_CONTENT_NEWS_LINE "New community content is out: press UPDATE NOW to get it"
 
 /* The CPU level of a 3-Way's or Free for All's CPU fighters (build 67): the game's own CPU difficulty
  * (its Battle mode's Easy / Normal / Hard), counted from the default down. Online CPU fighters always
@@ -167,6 +177,7 @@ typedef struct NetRoom {
 #define NETPLAY_CAP_SPECTATE 16    /* spectator mode: rooms can be watched (netplay_lobby_spectate) */
 #define NETPLAY_CAP_FFAROT 8192    /* FFA rotation rooms (NETPLAY_MODE_FFAROT, build 66) */
 #define NETPLAY_CAP_HILL_CREATED 524288 /* build 76: created fighters in King of the Hill and FFA rotation rooms */
+#define NETPLAY_CAP_ORIGINAL 8388608   /* build 86: QUICK and RANKED carry the original-fighters choice */
 #define NETPLAY_CAP_RANDOM_VENUE 16384  /* RANDOM in the venue vote (build 67): netplay_lobby_vote(NETPLAY_VOTE_RANDOM) */
 /* NetRoomPlayer.voted and netplay_lobby_vote(): RANDOM, the relay draws the venue from the room's pool when
  * it wins. Only with relays answering NETPLAY_CAP_RANDOM_VENUE. */
@@ -316,6 +327,15 @@ int netplay_lobby_players(NetPlayer *out, int max, int *online, int *rooms);
 void netplay_lobby_create(const NetRoomSettings *settings);
 void netplay_lobby_join(const char *code);
 void netplay_lobby_quick(int mode, int max);
+/* Build 86, "Original fighters only" or "All fighters (community too)": the player's choice where a search
+ * starts, remembered per match type (a bit per type of the setting [online] original_fighters; ranked too),
+ * default all fighters (what every search was before). QUICK sends the type's choice and RANKED its flag to relays
+ * answering NETPLAY_CAP_ORIGINAL: original-only searches meet original-only (STANDARD ONLY) rooms, and an
+ * all-fighters one joins such a room when no other is open (server relay/original.go). RECOMP_TEST_QUICK_ORIGINAL
+ * (tests: 1 or 0) beats the setting. */
+int netplay_original(int mode);         /* 1 original fighters only; mode NETPLAY_ORIGINAL_RANKED: ranked */
+void netplay_set_original(int mode, int on);
+#define NETPLAY_ORIGINAL_RANKED (-1)
 /* Spectator mode (docs/research/spectator-mode.md): watch the room with this code; the room's
  * NetRoom.you is then NETPLAY_SLOT_SPECTATOR and every match that starts in it is run here from the
  * players' inputs, with no local player. Only when netplay_lobby_caps() has NETPLAY_CAP_SPECTATE. */
@@ -370,6 +390,9 @@ void netplay_lobby_ready(int ready, int fighter);
  * to a relay that answered CAPS_SKINS (else as netplay_lobby_ready). netplay_lobby_skins: the relay takes skins. */
 void netplay_lobby_ready_skin(int ready, int fighter, int skin);
 int netplay_lobby_skins(void);
+/* Build 86: the relay takes community fighters beyond the places by number (NETPLAY_CAP_UNLIMITED): a fighter of
+ * 1000 and up (fighter_banks.h) goes to netplay_lobby_ready as it is; the room and START name it by its number. */
+int netplay_lobby_unlimited(void);
 void netplay_lobby_vote(int choice);
 void netplay_lobby_leave(void);
 /* King of the Hill: give up this PC's place in the line (to the back; a king gives up the crown).
@@ -496,7 +519,14 @@ typedef struct NetDelayInfo { int in_fight, estimate, rollback, frames, path_ms;
 int netplay_delay_info(NetDelayInfo *o);    /* 1 while rollback runs steps again */
 /* For diagnostics: one line on the online fight's step, rollback state and counters. */
 int netplay_rollback_brief(char *out, int size);
+int netplay_rts_match(void);    /* the running (or last) online fight came from a Run the Streets room */
+/* build 87: that fight's round rules, START's rounds byte (openworld.h ow_rules_rts_*: the time limit and the KO
+ * target the room's host chose, which the relay checked); 0 the defaults */
+int netplay_rts_rules(void);
+int netplay_rts_room(void);     /* this PC is in a Run the Streets room (between fights too) */
+int netplay_relay_rts(void);    /* the relay answered CAPS with NETPLAY_CAP_RTS */
 int netplay_local_slot(void);   /* tests: this PC's fighter slot in a lockstep fight, -1 otherwise */
+int netplay_fighter_of_room_slot(int slot);  /* the running match's fighter of room slot `slot`, -1 none */
 int netplay_countdown_active(void);  /* this fight has the start countdown (online always; offline per [gameplay] offline_countdown) */
 
 /* Voice chat (voice.c): 1 while this PC is in a room of the online hub (its lobby or its match); a

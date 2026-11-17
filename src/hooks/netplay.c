@@ -42,12 +42,14 @@
 #include "netplay.h"
 #include "netplay_delay_rules.h"
 #include "recomp_settings.h"
+#include "pc_settings.h"
 #include "updater.h"
 #include "automatch.h"
 #include "online_data.h"
 #include "account.h"
 #include "social.h"
 #include "rollback.h"
+#include "openworld.h"
 #include "test_observations.h"
 #include "netplay_servers.h"
 #include "netplay_check.h"
@@ -56,8 +58,10 @@
 #include "pc_input.h"
 #include "pc_content.h"
 #include "pc_mods.h"
+#include "content_update.h"
 #include "fight_hud.h"
 #include "fighter_skins.h"
+#include "fighter_banks.h"
 #include "start_countdown.h"
 #include "detmath/detmath.h"
 
@@ -69,6 +73,33 @@
 #define G_RESULT_COUNT 0x003BE624u
 #define RESULTS_MAX    ((G_RESULT_COUNT - G_RESULTS) / 0x10u)
 #define G_CROWD_RECORDS 0x003494E0u     /* count of the crowd's "audience public" records */
+
+/* Build 86: "Original fighters only" or "All fighters (community too)", remembered per match type (netplay.h):
+ * one bit of [online] original_fighters per type (0..23 as they are, King of the Hill 24 and 25, FFA rotation 26,
+ * Ranked 28). */
+static int original_bit(int mode)
+{
+    if (mode == NETPLAY_ORIGINAL_RANKED) return 28;
+    if (mode >= 0x40 && mode <= 0x42) return 24 + (mode - 0x40);
+    return mode >= 0 && mode < 24 ? mode : -1;
+}
+
+int netplay_original(int mode)
+{
+    const char *t = getenv("RECOMP_TEST_QUICK_ORIGINAL");
+    int bit = original_bit(mode);
+    if (t && (t[0] == '0' || t[0] == '1') && !t[1]) return t[0] == '1';
+    return bit >= 0 && ((unsigned)recomp_settings_get("online", "original_fighters", 0) >> bit & 1u) ? 1 : 0;
+}
+
+void netplay_set_original(int mode, int on)
+{
+    int bit = original_bit(mode);
+    unsigned v = (unsigned)recomp_settings_get("online", "original_fighters", 0);
+    if (bit < 0) return;
+    v = on ? v | 1u << bit : v & ~(1u << bit);
+    if (recomp_settings_set("online", "original_fighters", (int)v) > 0) pc_settings_save();
+}
 
 #if !defined(_WIN32)
 
@@ -112,6 +143,7 @@ void netplay_lobby_settings(const NetRoomSettings *s) { (void)s; }
 void netplay_lobby_ready(int r, int f) { (void)r; (void)f; }
 void netplay_lobby_ready_skin(int r, int f, int k) { (void)r; (void)f; (void)k; }
 int netplay_lobby_skins(void) { return 0; }
+int netplay_lobby_unlimited(void) { return 0; }
 void netplay_lobby_vote(int c) { (void)c; }
 void netplay_lobby_leave(void) {}
 void netplay_lobby_yield(void) {}
@@ -164,6 +196,11 @@ void *netplay_sound_handler(uint32_t va) { (void)va; return NULL; }
 void netplay_on_pad_read(uint32_t a) { start_countdown_hold(a, start_countdown_offline_step(), 0); }
 int netplay_countdown_active(void) { return start_countdown_active(0); }
 int netplay_local_slot(void) { return -1; }
+int netplay_rts_match(void) { return 0; }
+int netplay_rts_rules(void) { return 0; }
+int netplay_rts_room(void) { return 0; }
+int netplay_fighter_of_room_slot(int s) { (void)s; return -1; }
+int netplay_relay_rts(void) { return 0; }
 int netplay_delay_info(NetDelayInfo *o) { if (o) memset(o, 0, sizeof(*o)); return 0; }
 void netplay_on_seed(uint32_t e, int w, uint32_t x) { (void)e; (void)w; (void)x; }
 void netplay_on_result(uint32_t w, uint32_t l, uint32_t c) { (void)w; (void)l; (void)c; }
@@ -194,8 +231,8 @@ void netplay_crowd_update(void) { sub_00081170(); }
 #define PROJECT_SERVER_ADDRESS "49.12.78.32"
 #define PROJECT_NA_NAME        "na.defjam.online"     /* US East (build 30; "North America" until 37) */
 #define PROJECT_NA_ADDRESS     "5.161.206.134"
-#define PROJECT_WEST_NAME      "west.defjam.online"   /* US West (build 38) */
-#define PROJECT_WEST_ADDRESS   "5.78.214.178"
+#define PROJECT_WEST_NAME      "sg.defjam.online"     /* Asia (Singapore) (build 89; the NETSERVER_WEST slot) */
+#define PROJECT_WEST_ADDRESS   "5.223.88.150"
 #define PROTO         1
 #define T_HELLO       0x01
 #define T_WELCOME     0x02
@@ -314,6 +351,26 @@ void netplay_crowd_update(void) { sub_00081170(); }
 #define CAPS_XPLAY_OPT (recomp_settings_get("online", "crossplay_android", 0) ? CAPS_XPLAY_ANDROID : 0u) /* sent only while on */
 #define CAPS_SKINS    4194304u  /* 1 << 22 (build 85), both ways: READY's third byte is the player's skin of a stock fighter,
                                  * and START (WATCH, WATCHLATE) ends with the players' skins (src/hooks/fighter_skins.c) */
+#define CAPS_ORIGINAL 8388608u  /* 1 << 23 (build 86), both ways: QUICK ends with the search's choice (1 original fighters
+                                 * only, 0 all fighters) after the ping; RANKED's flags carry NETRANK_FLAG_ORIGINAL */
+#define CAPS_UNLIMITED 33554432u /* 1 << 25 (build 86), both ways: community fighters beyond the places (fighter_banks.h).
+                                 * READY ends with the fighter number (u32: 1000 and up, the byte its template), ROOM
+                                 * with the players' numbers, START (WATCH, WATCHLATE) after the skins with the match's
+                                 * numbers; the relay keeps one only where every member announced this bit and has the
+                                 * room's content print (server docs/unlimited-fighters-online.md) */
+/* build 86: a community fighter number (1000 and up; not the select grid's MORE cell) */
+static int is_number(int fighter) { return fighter >= FB_FIRST_LOGICAL && fighter != FB_MORE_ID; }
+/* Build 86: a community fighter beyond the places (fighter_banks.h, 1000 and up) on the wire: READY's byte is its
+ * template (the stock fighter it was made from: what a relay plays that cannot keep the number), the number follows
+ * the skin byte. Without the community fighter on this PC: Doc. */
+static int unl_template(int number)
+{
+    const FighterBanksEntry *e = fighter_banks_find(number);
+    return e && e->template_fe_id >= 0 && e->template_fe_id < 0xFF ? e->template_fe_id : 55;
+}
+
+/* build 86: CAPS_UNLIMITED unless a test plays an older game (RECOMP_TEST_NO_UNLIMITED) */
+#define CAPS_UNLIMITED_OPT (getenv("RECOMP_TEST_NO_UNLIMITED") ? 0u : CAPS_UNLIMITED)
 #define CP_WAIT_MS    10000     /* START: how long to wait for a created fighter's missing record */
 #define CAPS_TRIES    5         /* CAPS every RETRY_MS; no answer after these: an older relay */
 #define WINNER_DRAW   0xFFu
@@ -498,6 +555,8 @@ static struct {
     AutoMatch cp_wait_m;
     int koth_match;                 /* this START is a King of the Hill fight (or an FFA rotation one) */
     int rot_match;                  /* this START is an FFA rotation fight: up to four, the winner stays */
+    int rts_match;                  /* this START is a Run the Streets fight (NETPLAY_MODE_RTS room) */
+    int rts_rules;                  /* build 87: its round rules, START's rounds byte (never the game's own rules) */
     int rot_out[MAXP];              /* FFA rotation: when each position was put out (1, 2, ...), 0 still in */
     int rot_outs;
     uint8_t koth_order[MAXP];       /* FFA rotation: the RESULT's finishing order (room slots, best first) */
@@ -687,6 +746,7 @@ static struct {
         uint32_t crowd_gen[6];
         int crowd_gen_on;
         uint32_t seeds[32][2];
+        uint8_t ow[OW_STATE_BYTES];     /* Big Arena's scores and respawns (openworld.c) */
     } snap[ROLLBACK_SLOTS];
     unsigned rb_count, rb_steps, rb_deepest, rb_failed;
     double rb_ms_max, rb_ms_total;
@@ -795,6 +855,7 @@ static unsigned room_rb_class(void)
     if (N.rank.valid && N.rank.has_set && !memcmp(N.rank_room, N.roomv.code, 6) && !NETPLAY_IS_HILL(mode))
         return NETPLAY_RB_RANKED;
     if (NETPLAY_IS_FFAROT(mode)) return NETPLAY_RB_KOTH;    /* one fight per START, as on the hill */
+    if (NETPLAY_IS_RTS(mode)) return NETPLAY_RB_FFA;
     if (NETPLAY_IS_KOTH(mode))
         return N.crew.battle && !memcmp(N.crew_room, N.roomv.code, 7) ? NETPLAY_RB_CREW : NETPLAY_RB_KOTH;
     if (mode == ONLINE_MODE_TEAM) return NETPLAY_RB_TEAM;
@@ -880,6 +941,19 @@ int netplay_delay_info(NetDelayInfo *o)
     return ok;
 }
 int netplay_local_slot(void) { return N.lockstep && !N.watching ? N.pos : -1; }
+int netplay_rts_match(void) { return N.rts_match; }
+int netplay_rts_rules(void) { return N.rts_rules; }
+int netplay_rts_room(void) { return N.roomv.in_room && NETPLAY_IS_RTS(N.roomv.settings.mode); }
+/* Run the Streets' social layer (rts_social.c): the fighter (START position) of a room slot in the running match, for
+ * the chat bubbles and proximity voice; -1 none (a spectator, not in this match, no match). Read only, any thread. */
+int netplay_fighter_of_room_slot(int slot)
+{
+    int pos;
+    if (slot < 0 || slot >= ROOMSLOTS || !N.lobby || !N.match_live) return -1;
+    pos = N.pos_of_slot[slot];
+    return pos >= 0 && pos < MAXP && pos < N.players ? pos : -1;
+}
+int netplay_relay_rts(void) { return N.relay_caps > 0 && (N.relay_caps & NETPLAY_CAP_RTS) != 0; }
 
 static BOOL CALLBACK init_once(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -2395,6 +2469,17 @@ static void make_data_print(void)
         if (n < (int)sizeof(text)) n += snprintf(text + n, sizeof(text) - (size_t)n, "%s%s %08X", i ? ", " : "", k_fight_files[i], f);
         if (overridden && o < (int)sizeof(over)) o += snprintf(over + o, sizeof(over) - (size_t)o, " %s", k_fight_files[i]);
     }
+    {   /* build 86: the community fighters' side file (fighter_banks.h) where there is one: which record each number
+         * binds to. It follows from the database for the same composer, so this only catches a mixed install; the
+         * print of a PC without one is as before. */
+        int overridden = 0;
+        uint32_t f = file_print(FB_SIDE_FILE, &overridden);
+        if (f) {
+            h = mix32(h ^ f ^ 0x46464C46u);
+            if (n < (int)sizeof(text)) n += snprintf(text + n, sizeof(text) - (size_t)n, ", %s %08X", FB_SIDE_FILE, f);
+            if (overridden && o < (int)sizeof(over)) o += snprintf(over + o, sizeof(over) - (size_t)o, " %s", FB_SIDE_FILE);
+        }
+    }
     snprintf(g_data_over, sizeof(g_data_over), "%s", o ? over + 1 : "");
     g_data_print = h ? h : 1;
     fprintf(stderr, "[NETPLAY] game files %08X (%u ms): %s%s%s\n", g_data_print,
@@ -2595,6 +2680,10 @@ static int every_player_rolls_back(void)
         if (koth < 0) koth = getenv("RECOMP_ROLLBACK_KOTH") && *getenv("RECOMP_ROLLBACK_KOTH") == '1';
         if (N.koth_match && !koth && !every_player_must()) return 0;
     }
+    /* Run the Streets (build 86) stays in lockstep: its respawns and scores are in every rollback save and the
+     * depth-8 soak ran clean offline, but no long online rollback run yet. Every PC knows the room's mode from ROOM.
+     * Tests: RECOMP_ROLLBACK_RTS=1 on every copy lifts it. */
+    if (N.rts_match && !(getenv("RECOMP_ROLLBACK_RTS") && *getenv("RECOMP_ROLLBACK_RTS") == '1')) return 0;
     for (i = 0; i < N.players; i++) if (!N.peer_rb[i]) return 0;
     if (match_has_created())
         for (i = 0; i < N.players; i++) if (!N.peer_rb_cp[i]) return 0;
@@ -3210,6 +3299,17 @@ static void on_room(const uint8_t *b, int len)
         rdbytes(&r, v.blocked, v.blocked_count);
         if (r.bad) return;
     }
+    if (r.i < r.n) {    /* build 86: the players' community fighter numbers (relays answering CAPS_UNLIMITED) */
+        int nn = rd8(&r), k;
+        for (k = 0; k < nn && !r.bad; k++) {
+            int s = rd8(&r), j;
+            uint32_t num = 0;
+            for (j = 0; j < 4; j++) num |= (uint32_t)rd8(&r) << (8 * j);     /* in order: no reads in one expression */
+            if (r.bad || !is_number((int)num) || num > 0x7FFFFFFFu) return;
+            for (j = 0; j < count; j++) if (v.players[j].slot == s) v.players[j].fighter = (int)num;
+        }
+        if (r.bad) return;
+    }
     v.in_room = 1;
     v.received = GetTickCount64();
     EnterCriticalSection(&g_cs);
@@ -3795,6 +3895,26 @@ static void on_start_as(const uint8_t *b, int len, int watching)
             }
             if (r.bad) return;
         }
+        if (r.i < r.n) {    /* build 86: the community fighters' numbers, after the skins (relays answering
+                             * CAPS_UNLIMITED); each replaces its player's template byte */
+            int nn = rd8(&r), k;
+            for (k = 0; k < nn && !r.bad; k++) {
+                int s = rd8(&r), j;
+                uint32_t num = 0;
+                for (j = 0; j < 4; j++) num |= (uint32_t)rd8(&r) << (8 * j);
+                if (r.bad || num > 0x7FFFFFFFu || !is_number((int)num)) return;
+                for (j = 0; j < count; j++) if (slots[j] == s) fighters[j] = (int)num;
+            }
+            if (r.bad) return;
+        }
+        /* the four bank rows (124..127) are each PC's per-slot rows for the numbers: never a fighter of their own
+         * online (an older client's place there); Doc on every PC that has them, as the relay's own fallback */
+        if (fighter_banks_ready())
+            for (i = 0; i < count; i++)
+                if (fighter_banks_index(fighters[i]) >= 0) {
+                    fprintf(stderr, "[BANKS] START: fighter %d is a bank row here; the player plays Doc\n", fighters[i]);
+                    fighters[i] = 55;
+                }
         if (!(N.start_seed && seed == N.start_seed)) {
             EnterCriticalSection(&g_cs);
             memcpy(N.cp_start_crc, named, sizeof(named));
@@ -3931,6 +4051,11 @@ static void on_start_as(const uint8_t *b, int len, int watching)
     N.koth_match = NETPLAY_IS_HILL(N.roomv.settings.mode);
     /* FFA rotation: the same, with up to four; a player who leaves is out and the others fight on */
     N.rot_match = NETPLAY_IS_FFAROT(N.roomv.settings.mode);
+    N.rts_match = NETPLAY_IS_RTS(N.roomv.settings.mode);
+    /* build 87: a Run the Streets room's rounds byte is its round rules (time limit, KO target; openworld.c reads it at
+     * the set-up), never the game's own match rules, which stay 0 as before */
+    N.rts_rules = N.rts_match && ow_rules_rts_valid(m.rules) ? m.rules : 0;
+    if (N.rts_match) m.rules = N.report_m.rules = 0;
     memset(N.rot_out, 0, sizeof(N.rot_out));
     N.rot_outs = N.koth_order_n = 0;
     /* a ranked set's game: its RESULT goes to the relay too (the set's score, the loser's venue pick) */
@@ -4331,12 +4456,26 @@ static void on_packet(const uint8_t *b, int len)
                 text = ping_why;
             }
             if (code == 8 && N.pend_len && N.pend[5] == T_TPICK) text = "That stage can't be picked now.";
+            {   /* build 86: a relay's own sentence for a refusal (Run the Streets: closed test, sign in, the check),
+                 * after the code; "not allowed" alone keeps the client's own text */
+                static char said[200];
+                int k, n = 0;
+                int tl = len > 8 ? (int)b[7] : 0;      /* ERROR: code, then the text with its length byte */
+                if (tl > len - 8) tl = len - 8;
+                if (code == 8 && tl > 0 && !(tl == 11 && !memcmp(b + 8, "not allowed", 11))) {
+                    for (k = 8; k < 8 + tl && n < (int)sizeof(said) - 1; k++)
+                        if (b[k] >= 0x20 && b[k] < 0x7F) said[n++] = (char)b[k];
+                    said[n] = 0;
+                    if (n >= 12) text = said;
+                }
+            }
             if (code == 15) {   /* build 82: the room has other community packs; most often new ones are out */
                 char problem[512];      /* build 83: the last sync failed (the hub line says why; error[] is short) */
                 text = pc_content_problem(problem, sizeof(problem)) ? "Your community content is not up to date: start the game from the launcher again."
                      : pc_content_news(NULL, 0) > 0 ? NETPLAY_CONTENT_NEWS_LINE "."
                      : "That room has other community packs than yours: both need the same ones.";
                 if (N.lobby) pc_mods_check_start();     /* look again: the hub shows the news once it is known */
+                if (pc_content_news(NULL, 0) > 0) content_update_note_refusal();    /* build 86: UPDATE NOW offered */
             }
             if (N.lobby && code == 12) {
                 /* build 46 relays: this player's created fighter has stats Story mode never gives (a
@@ -4579,8 +4718,8 @@ static DWORD WINAPI net_thread(LPVOID unused)
                 uint8_t cb[6 + 8 + 4];
                 int n = header(cb, T_CAPS);
                 memcpy(cb + n, N.token, 8); n += 8;
-                put32(cb + n, CAPS_KOTH | CAPS_CREATED | CAPS_SPECTATE | CAPS_STATS_ERR | CAPS_SPEC_REMATCH | CAPS_CHAT |
-                              CAPS_CREW | CAPS_RB_MODES | CAPS_RB_PING | CAPS_RB_FRAMES | CAPS_SPEC_LATE | CAPS_CPULEVEL | CAPS_ROOMRULES |
+                put32(cb + n, CAPS_KOTH | NETPLAY_CAP_RTS | CAPS_ORIGINAL | CAPS_CREATED | CAPS_SPECTATE | CAPS_STATS_ERR | CAPS_SPEC_REMATCH | CAPS_CHAT |
+                              CAPS_CREW | CAPS_RB_MODES | CAPS_RB_PING | CAPS_RB_FRAMES | CAPS_SPEC_LATE | CAPS_CPULEVEL | CAPS_ROOMRULES | CAPS_UNLIMITED_OPT |
                               CAPS_TSET | CAPS_FFAROT | CAPS_RANDOM_VENUE | CAPS_HILL_WATCH | CAPS_HILL_READYUP | CAPS_SKINS | CAPS_XPLAY_OPT | CAPS_HILL_CREATED); n += 4;
                 send_raw(cb, n);
             } else {
@@ -5530,9 +5669,16 @@ int netplay_spectating(void)
 
 void netplay_lobby_quick(int mode, int max)
 {
-    int most = room_max(mode);
-    uint8_t b[4] = { (uint8_t)mode, (uint8_t)(max < 2 ? 2 : max > most ? most : max) };
-    request(T_QUICK, b, 2 + put_ping(b + 2));
+    int most = room_max(mode), n, original = netplay_original(mode);
+    uint8_t b[5] = { (uint8_t)mode, (uint8_t)(max < 2 ? 2 : max > most ? most : max) };
+    n = 2 + put_ping(b + 2);
+    if (relay_has(CAPS_ORIGINAL)) {     /* build 86: the search's choice after the ping (unknown: 0xFFFF) */
+        if (n == 2) { b[2] = b[3] = 0xFF; n = 4; }
+        b[n++] = (uint8_t)(original ? 1 : 0);
+    }
+    fprintf(stderr, "[NETPLAY] quick match: mode %d, %s%s\n", mode, original ? "original fighters only" : "all fighters",
+            relay_has(CAPS_ORIGINAL) ? "" : " (the relay takes no choice)");
+    request(T_QUICK, b, n);
 }
 
 /* Asks the account service for a ticket (it blocks), then joins the queue with it. */
@@ -5578,6 +5724,10 @@ static DWORD WINAPI ranked_thread(LPVOID param)
         LeaveCriticalSection(&g_cs);
         netranked_encode_ext(b + TICKET_LEN + 1, modes, primary, rb, pings, code);
         b[TICKET_LEN + 1 + 1] |= NETRANK_FLAG_WHY;     /* build 54: a refusal says why (QUEUE 2's reason) */
+        EnterCriticalSection(&g_cs);
+        if (relay_has(CAPS_ORIGINAL) && netplay_original(NETPLAY_ORIGINAL_RANKED))
+            b[TICKET_LEN + 1 + 1] |= NETRANK_FLAG_ORIGINAL;    /* build 86: original fighters only: no skins */
+        LeaveCriticalSection(&g_cs);
     }
     fprintf(stderr, "[NETPLAY] ranked: queueing for %s (modes %u)%s%s, pings %d/%d/%d ms\n", netranked_mode_title(primary),
             modes, code[0] ? ", set " : "", code, pings[0], pings[1], pings[2]);
@@ -5619,6 +5769,7 @@ void netplay_lobby_ranked_ex(int fighter, unsigned modes, int primary)
     if (primary < 0 || primary >= NETRANK_MODES) primary = NETRANK_CLASSIC;
     modes |= 1u << primary;
     if (fighter == 99 && primary != NETRANK_OPEN) fighter = 55;    /* a created fighter plays in Open only */
+    if (is_number(fighter)) fighter = unl_template(fighter);        /* build 86: ranked is stock only (RANKED's byte) */
     EnterCriticalSection(&g_cs);
     N.rk_fighter = fighter;
     N.rk_modes = modes & 7u;
@@ -5767,6 +5918,16 @@ void netplay_lobby_ready(int ready, int fighter)
     netplay_lobby_ready_skin(ready, fighter, skin);
 }
 
+int netplay_lobby_unlimited(void)
+{
+    int on;
+    InitOnceExecuteOnce(&g_once, init_once, NULL, NULL);
+    EnterCriticalSection(&g_cs);
+    on = relay_has(CAPS_UNLIMITED);
+    LeaveCriticalSection(&g_cs);
+    return on;
+}
+
 int netplay_lobby_skins(void)
 {
     int on;
@@ -5779,13 +5940,25 @@ int netplay_lobby_skins(void)
 
 void netplay_lobby_ready_skin(int ready, int fighter, int skin)
 {
-    /* build 85: the skin as a third byte, only to a relay that answered CAPS_SKINS (an older one reads two) */
-    uint8_t b[3] = { (uint8_t)(ready ? 1 : 0), (uint8_t)fighter, (uint8_t)(skin > 0 && skin <= FIGHTER_SKINS_PER ? skin : 0) };
-    int len = 2;
+    /* build 85: the skin as a third byte, only to a relay that answered CAPS_SKINS (an older one reads two);
+     * build 86: a community fighter's number after it (relays answering CAPS_UNLIMITED), its template in the byte */
+    uint8_t b[7] = { (uint8_t)(ready ? 1 : 0), (uint8_t)fighter, (uint8_t)(skin > 0 && skin <= FIGHTER_SKINS_PER ? skin : 0) };
+    int len = 2, number = is_number(fighter) ? fighter : 0;
     InitOnceExecuteOnce(&g_once, init_once, NULL, NULL);
+    if (number) {
+        b[1] = (uint8_t)unl_template(number);
+        b[2] = 0;
+    }
     EnterCriticalSection(&g_cs);
     if (relay_has(CAPS_SKINS) && fighter >= 0 && fighter < 0xFF) len = 3;
-    if (N.roomv.in_room && NETPLAY_IS_HILL(N.roomv.settings.mode) && fighter >= 0 && fighter < 0xFF) {
+    if (number && relay_has(CAPS_UNLIMITED)) {
+        len = 7;
+        put32(b + 3, (uint32_t)number);
+    } else if (number) {
+        if (relay_has(CAPS_SKINS)) len = 3;
+        fighter = b[1];     /* a relay without the bit: the template, as the room will show it */
+    }
+    if (N.roomv.in_room && NETPLAY_IS_HILL(N.roomv.settings.mode) && ((fighter >= 0 && fighter < 0xFF) || is_number(fighter))) {
         /* build 73: kept until the room has it (hill_pick_tick), and the fighter of this PC's next ready */
         if (N.koth_pick != fighter) N.koth_pick_tries = 0;
         N.koth_pick = fighter;
@@ -5793,6 +5966,9 @@ void netplay_lobby_ready_skin(int ready, int fighter, int skin)
     }
     LeaveCriticalSection(&g_cs);
     if (len == 3 && b[2]) fprintf(stderr, "[SKINS] READY: fighter %d, skin %d\n", fighter, b[2]);
+    if (len == 7) fprintf(stderr, "[BANKS] READY: community fighter %d (template %d)\n", number, b[1]);
+    else if (number) fprintf(stderr, "[BANKS] READY: community fighter %d plays its template %d (the relay takes no "
+                             "fighter numbers)\n", number, b[1]);
     request(T_READY, b, len);
 }
 
@@ -6475,8 +6651,8 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
     static char chosen[128];
     int i;
     (void)unused;
-    /* RECOMP_NETPLAY_SERVER=auto|eu|na|west|all: the server choice as a player makes it (build 30), with
-     * RECOMP_NETPLAY_SERVER_EU/_NA/_WEST for the relays' addresses; anything else is the address */
+    /* RECOMP_NETPLAY_SERVER=auto|eu|na|sg|all: the server choice as a player makes it (build 30), with
+     * RECOMP_NETPLAY_SERVER_EU/_NA/_SG for the relays' addresses; anything else is the address */
     if (netservers_choice() != NETCHOICE_CUSTOM) {
         server = netservers_address_wait(chosen, sizeof(chosen), 4000);
         fprintf(stderr, "[NETPLAY] tests: server %s\n", server);
@@ -6545,7 +6721,7 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
         int idle_from = idle_env && *idle_env ? atoi(idle_env) : 0, call_no = 0, idle_told = 0;
         netplay_lobby(server, name && *name ? name : "Test player");
         for (i = 0; i < 600 && N.state == NETPLAY_CONNECTING; i++) Sleep(100);
-        {   /* RECOMP_TEST_SERVER_SWITCH="<ms>,<eu|na|west|auto>": after that long in the lobby, switch the
+        {   /* RECOMP_TEST_SERVER_SWITCH="<ms>,<eu|na|sg|auto>": after that long in the lobby, switch the
              * server the way the hub's server picker does (netservers_reconnect), then quick-match there */
             const char *sw = getenv("RECOMP_TEST_SERVER_SWITCH");
             if (sw && *sw && strchr(sw, ',')) {
@@ -6865,6 +7041,30 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
                     }
                     Sleep(100);
                     continue;
+                }
+            }
+            {   /* RECOMP_TEST_RTS_RULES=<minutes>,<KOs> (tests, build 87; minutes 5, 10, 15 or 0 for none, KOs 5, 10,
+                 * 20): the host sets its Run the Streets room's round rules (the rounds byte). Once the room holds a
+                 * second player, and not ready before: the relay's QUICK only joins rooms at the default rules, so a
+                 * host that changed them at once stayed alone (each test copy opened a room of its own). */
+                const char *tt = getenv("RECOMP_TEST_RTS_RULES");
+                if (tt && *tt && strchr(tt, ',') && r.in_room && r.phase == 0 && r.you == r.host && !N.match_live &&
+                    NETPLAY_IS_RTS(r.settings.mode)) {
+                    int want_rules = ow_rules_rts_encode(ow_rules_rts_time_index(atoi(tt) * 60),
+                                                         ow_rules_rts_ko_index(atoi(strchr(tt, ',') + 1)));
+                    if (r.settings.rounds != want_rules) {
+                        static ULONGLONG asked;
+                        if (r.player_count >= 2 && GetTickCount64() - asked > 1000) {
+                            NetRoomSettings want = r.settings;
+                            asked = GetTickCount64();
+                            want.rounds = want_rules;
+                            fprintf(stderr, "[NETPLAY] tests: the Run the Streets room's round rules are %02X (%s)\n",
+                                    want_rules, tt);
+                            netplay_lobby_settings(&want);
+                        }
+                        Sleep(100);
+                        continue;
+                    }
                 }
             }
             {   /* RECOMP_TEST_FIGHTER_RULES=all|nobanned|nocreated|stock[+standard]|standard and RECOMP_TEST_MAX_PING=MS
@@ -8381,6 +8581,10 @@ static void step_run(void)
         if (fold < 0) fold = getenv("RECOMP_NETPLAY_HASH_WEAPONS") && *getenv("RECOMP_NETPLAY_HASH_WEAPONS") == '1';
         if (fold) N.hash_at[k] = (N.hash_at[k] ^ w) * 16777619u;
     }
+    {   /* Big Arena's scores and respawns (0 and no change while no such fight runs) */
+        uint32_t ow = ow_state_hash();
+        if (ow) N.hash_at[k] = (N.hash_at[k] ^ ow) * 16777619u;
+    }
     {   /* the x87 control word the step starts with (its precision bits round every result): a
          * change is logged, at most 12 a match, to compare the PCs of a desynced match */
         static uint16_t last_cw;
@@ -9137,6 +9341,7 @@ static void snap_save(void)
     N.snap[slot].test_step = defjam_test_current_step();
     memcpy(N.snap[slot].crowd_gen, g_crowd_gen, sizeof(g_crowd_gen));
     N.snap[slot].crowd_gen_on = g_crowd_gen_on;
+    ow_state_save(N.snap[slot].ow);
     EnterCriticalSection(&g_cs);
     memcpy(N.snap[slot].seeds, N.seeds, sizeof(N.snap[slot].seeds));
     LeaveCriticalSection(&g_cs);
@@ -9220,6 +9425,7 @@ static void rollback_to(uint32_t f)
     defjam_test_set_step(N.snap[slot].test_step);
     memcpy(g_crowd_gen, N.snap[slot].crowd_gen, sizeof(g_crowd_gen));
     g_crowd_gen_on = N.snap[slot].crowd_gen_on;
+    ow_state_load(N.snap[slot].ow);
     EnterCriticalSection(&g_cs);
     memcpy(N.seeds, N.snap[slot].seeds, sizeof(N.snap[slot].seeds));
     LeaveCriticalSection(&g_cs);

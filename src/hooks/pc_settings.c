@@ -42,6 +42,7 @@
 #include "discord_presence.h"
 #include "pc_language.h"
 #include "pc_content.h"
+#include "content_update_logic.h"
 #include "patches/widescreen.h"
 #include "patches/picture.h"
 #include "patches/cheats.h"
@@ -63,6 +64,7 @@ static const char *const k_ws_hud[] = { "auto", "edges", "centered", NULL };
 static const char *const k_ws_cutscenes[] = { "authored", "fill", NULL };
 static const char *const k_ws_fill[] = { "blur", "black", NULL };
 static const char *const k_crowd_near[] = { "fade", "hide", NULL };
+static const char *const k_ow_camera[] = { "stock", "follow", "behind", NULL };
 
 /* A four-fighter match holds about 2 GiB of replacements. At 512 MiB the cache evicted and
  * re-decoded dozens of textures every two seconds in a fight on the Steam Deck. */
@@ -79,8 +81,8 @@ static RecompSetting g_display_settings[] = {
     { "textures", "dump_limit", RECOMP_SETTING_INT, 2000, 0, 65536, NULL, "RECOMP_TEXTURE_DUMP_LIMIT", RECOMP_SETTING_RESTART,
       "Maximum new source images captured in one run." },
     { "online", "server", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_NETPLAY_SERVER", 0,
-      "The server for online play: auto (the one with the lowest ping of Europe, US East and US West), eu, na "
-      "(US East), west (US West), all (the rooms of every server; the hub connects to the lowest ping and moves "
+      "The server for online play: auto (the one with the lowest ping of Europe, US East and Singapore), eu, na "
+      "(US East), sg (Asia (Singapore)), all (the rooms of every server; the hub connects to the lowest ping and moves "
       "to join; \"both\" of older builds means all), or a relay's own address as host or host:port (port 27777 "
       "if left out). Quick Match widens to the other servers when nobody is waiting. Accounts and stats stay on "
       "Europe.", "auto" },
@@ -133,6 +135,11 @@ static RecompSetting g_display_settings[] = {
       "Let quick match, rooms and King of the Hill pair you with players of the community Android port "
       "(by contatg) in builds that FFNY Online has tested for cross-play. Off: you only meet PC players. "
       "Ranked never mixes platforms. Takes effect the next time you go online." },
+    { "online", "original_fighters", RECOMP_SETTING_INT, 0, 0, 536870911, NULL, NULL, 0,
+      "Kept by the game: where you chose \"Original fighters only\" instead of \"All fighters (community too)\" "
+      "when you start a search (Quick Match per match type, King of the Hill, FFA rotation, Ranked), so the same "
+      "choice is ready next time. One bit per match type (0..23; King of the Hill 24 and 25, FFA rotation 26; "
+      "Ranked 28). 0: all fighters everywhere." },
     { "online", "rollback", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
       "Beta: rollback netcode in online fights, used only when every player in the match has it on. Your presses "
       "count at once and the game corrects itself when the other player's arrive late. It can still crash." },
@@ -228,6 +235,46 @@ static RecompSetting g_display_settings[] = {
       "The 3 - 2 - 1 - FIGHT! start countdown in offline fights too, with the fighters held until FIGHT. "
       "Online matches always have it. Off (the default): offline fights start at once, as in the original "
       "game." },
+    /* Open-world phase 1 (src/hooks/openworld.c): Big Arena, offline only until the room option (milestone 2). */
+    { "openworld", "big_arena", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, "RECOMP_OW_BIGARENA", 0,
+      "Big Arena (preview): offline free-for-all fights where a knocked-out fighter comes back after a few seconds "
+      "and the first to the score limit wins; the last fighter who hit someone gets the knockout. Made for the big "
+      "empty maps of FFNY Studio's Big Arena template. Offline only; Story and Team fights stay as they are." },
+    { "openworld", "score_limit", RECOMP_SETTING_INT, 5, 1, 50, NULL, "RECOMP_OW_SCORE_LIMIT", 0,
+      "Big Arena: knockouts needed to win." },
+    { "openworld", "respawn_seconds", RECOMP_SETTING_INT, 3, 1, 15, NULL, "RECOMP_OW_RESPAWN_SECONDS", 0,
+      "Big Arena: seconds before a knocked-out fighter comes back (then 2 seconds without damage)." },
+    { "openworld", "time_limit", RECOMP_SETTING_INT, 300, 0, 3600, NULL, "RECOMP_OW_TIME_LIMIT", 0,
+      "Big Arena: seconds of fighting before the leader wins (0: no time limit)." },
+    /* build 87: Run the Streets' VS CPU round rules (the page's TIME LIMIT and KO TARGET; online rooms have their own) */
+    { "openworld", "rts_time_limit", RECOMP_SETTING_INT, 10, 0, 15, NULL, "RECOMP_RTS_TIME_LIMIT", 0,
+      "Run the Streets VS CPU: minutes before the leader wins: 5, 10 or 15 (0: no time limit, the KO target ends it). "
+      "Set on the Run the Streets page." },
+    { "openworld", "rts_ko_target", RECOMP_SETTING_INT, 10, 5, 20, NULL, "RECOMP_RTS_KO_TARGET", 0,
+      "Run the Streets VS CPU: knockouts to win: 5, 10 or 20. Set on the Run the Streets page." },
+    { "openworld", "blazin", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, "RECOMP_OW_BLAZIN", 0,
+      "Big Arena: BLAZIN' moves. Off for now: a BLAZIN' on a map built with FFNY Studio crashes the game after the "
+      "fight (being fixed)." },
+    { "openworld", "nameplates", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_OW_NAMEPLATES", 0,
+      "Run the Streets: the players' names over the fighters' heads (CPUs as CPU), fading out beyond 30 m." },
+    { "openworld", "nameplate_self", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, "RECOMP_OW_NAMEPLATE_SELF", 0,
+      "Run the Streets: your own name over your fighter too." },
+    { "openworld", "minimap", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_OW_MINIMAP", 0,
+      "Run the Streets: the minimap in the top right (the streets' walls, every fighter, up is where the camera looks)." },
+    { "openworld", "minimap_range", RECOMP_SETTING_INT, 70, 30, 150, NULL, "RECOMP_OW_MINIMAP_RANGE", 0,
+      "Run the Streets: how far the minimap reaches, in metres from your fighter to its edge." },
+    { "openworld", "free_roam", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_OW_FREE_ROAM", 0,
+      "Run the Streets / Big Arena: out of combat your fighter walks freely and faces where it goes; a fight button "
+      "next to someone, a hit, or White/Black (or a right-stick flick) to lock on brings the fight stance back. "
+      "Online always on." },
+    { "openworld", "roam_seconds", RECOMP_SETTING_INT, 3, 1, 15, NULL, "RECOMP_OW_ROAM_SECONDS", 0,
+      "Free roam: seconds without a fight button or a hit before your fighter walks freely again (online 3)." },
+    { "openworld", "roam_speed", RECOMP_SETTING_INT, 100, 50, 200, NULL, "RECOMP_OW_ROAM_SPEED", 0,
+      "Free roam: walking speed in percent of the game's (online 100)." },
+    { "openworld", "camera", RECOMP_SETTING_ENUM, 1, 0, 0, k_ow_camera, "RECOMP_OW_CAMERA", 0,
+      "Big Arena camera: follow (your fighter, from above and behind; the stick works as always), behind (over the "
+      "shoulder, turns with your fighter) or stock (the game's own fight camera, which loses fighters far apart). "
+      "Only your PC sees it; the fight is the same on every PC." },
     { "music", "mode", RECOMP_SETTING_ENUM, 0, 0, 0, k_music_mode, "RECOMP_MUSIC_MODE", 0,
       "Your own songs (the music folder in the data folder, or add them in the launcher's Music): mine (only "
       "yours), mix (yours between the game's own tracks), original (the game's soundtrack only) or auto (mix "
@@ -688,7 +735,7 @@ static int local_address(const char *v)
 static int may_run_beside_another(void)
 {
     static const char *const vars[] = { "RECOMP_NETPLAY_SERVER_EU", "RECOMP_NETPLAY_SERVER_NA",
-                                        "RECOMP_NETPLAY_SERVER_WEST", "RECOMP_ACCOUNT_SERVER" };
+                                        "RECOMP_NETPLAY_SERVER_SG", "RECOMP_ACCOUNT_SERVER" };
     const char *settings = getenv("RECOMP_SETTINGS"), *one = getenv("RECOMP_NETPLAY_SERVER");
     int i, test_run = (settings && !_stricmp(settings, "none")) ||
                       (getenv("RECOMP_PAD_SCRIPT") && !getenv("RECOMP_PAD_HOST"));
@@ -724,6 +771,33 @@ static BOOL CALLBACK find_running(HWND w, LPARAM out)
     return TRUE;
 }
 
+/* Build 86: a whole-word flag on this process's command line (CU_FLAG, "--content-update"). */
+static int has_cmd_flag(const wchar_t *flag)
+{
+    const WCHAR *cmd = GetCommandLineW(), *p = cmd ? wcsstr(cmd, flag) : NULL;
+    size_t n = wcslen(flag);
+    while (p) {
+        if ((p == cmd || p[-1] == L' ' || p[-1] == L'\t') && (!p[n] || p[n] == L' ' || p[n] == L'\t')) return 1;
+        p = wcsstr(p + n, flag);
+    }
+    return 0;
+}
+
+/* Build 86: the launcher UPDATE NOW starts comes up while the game that started it is still closing: it waits for
+ * that copy's lock (up to 20 s) instead of showing it and exiting. 1 when the lock is this process's. */
+static int one_instance_wait(const WCHAR *name)
+{
+    ULONGLONG until = GetTickCount64() + 20000;
+    for (;;) {
+        g_single_instance = CreateMutexW(NULL, FALSE, name);
+        if (!g_single_instance || GetLastError() != ERROR_ALREADY_EXISTS) return 1;
+        if (GetTickCount64() >= until) return 0;
+        CloseHandle(g_single_instance);
+        g_single_instance = NULL;
+        Sleep(200);
+    }
+}
+
 static void one_instance_only(const char *root)
 {
     const char *cmd = GetCommandLineA();
@@ -732,7 +806,12 @@ static void one_instance_only(const char *root)
     if (cmd && strstr(cmd, "--launcher-child")) return;     /* the launcher holds it for us */
     if (may_run_beside_another()) return;
     instance_mutex_name(root, name, sizeof name / sizeof name[0]);
-    g_single_instance = CreateMutexW(NULL, FALSE, name);
+    if (has_cmd_flag(CU_FLAG)) {
+        if (one_instance_wait(name)) return;
+        fprintf(stderr, "[UI] UPDATE NOW: the closing copy still runs after 20 s\n");
+    } else {
+        g_single_instance = CreateMutexW(NULL, FALSE, name);
+    }
     if (!g_single_instance || GetLastError() != ERROR_ALREADY_EXISTS) return;
     fprintf(stderr, "[UI] FFNY Online is already running: showing it, this copy exits\n");
     fflush(stderr);
@@ -761,6 +840,38 @@ void pc_settings_capture_start(void)
         FreeEnvironmentStringsW(env);
     }
     if (!GetCurrentDirectoryW(MAX_PATH * 2, g_start_dir)) g_start_dir[0] = 0;
+}
+
+/* Build 86, UPDATE NOW: starts "<exe> <this command line, launcher switches out> --launcher --content-update" with
+ * the environment and directory this process was started with (content_update_logic.h). The one-copy lock is
+ * let go first: the new launcher waits for this process to end (one_instance_wait). 1 when it started. */
+int pc_settings_start_content_update(void)
+{
+    static WCHAR exe[32768];
+    const WCHAR *line = GetCommandLineW();
+    size_t n = wcslen(line) + 64;
+    WCHAR *cmd;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    int ok;
+    if (!GetModuleFileNameW(NULL, exe, 32768)) return 0;
+    cmd = (WCHAR *)malloc(n * sizeof(WCHAR));
+    if (!cmd || !cu_launcher_command(line, cmd, n)) { free(cmd); return 0; }
+    if (g_single_instance) { CloseHandle(g_single_instance); g_single_instance = NULL; }
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    ok = CreateProcessW(exe, cmd, NULL, NULL, FALSE, g_start_env ? CREATE_UNICODE_ENVIRONMENT : 0, g_start_env,
+                        g_start_dir[0] ? g_start_dir : NULL, &si, &pi) != 0;
+    free(cmd);
+    if (!ok) {
+        fprintf(stderr, "[UI] UPDATE NOW: the launcher could not be started (error %lu)\n", (unsigned long)GetLastError());
+        return 0;
+    }
+    fprintf(stderr, "[UI] UPDATE NOW: the launcher starts in update mode (%lu)\n", (unsigned long)pi.dwProcessId);
+    fflush(stderr);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
 }
 
 /* After the launcher, the game runs in a fresh process, started exactly as with the launcher
@@ -810,6 +921,8 @@ static void start_game_process(int reopen_launcher)
         WaitForSingleObject(pi.hProcess, INFINITE);
         graphics_mod_settled();
         GetExitCodeProcess(pi.hProcess, &code);
+        /* build 86: the game closed for UPDATE NOW: the launcher, in update mode, gets the content */
+        if (cu_after_child_exit(code) && pc_settings_start_content_update()) ExitProcess(0);
         ExitProcess(code);
     }
     /* In the background meanwhile (tray icon, update checks); when the game closes the launcher
@@ -818,25 +931,31 @@ static void start_game_process(int reopen_launcher)
     graphics_mod_settled();         /* the proxy is parked before the launcher opens again */
     /* the reopened launcher takes the one-copy lock itself */
     if (g_single_instance) { CloseHandle(g_single_instance); g_single_instance = NULL; }
-    n = wcslen(line) + 32;
+    /* build 86: the game closed for UPDATE NOW (content_update.c): the launcher opens in update mode (it presses
+     * PLAY once the new content is in); otherwise as it was started, without the update mode */
+    GetExitCodeProcess(pi.hProcess, &code);
+    int for_update = cu_after_child_exit(code);
+    n = wcslen(line) + 64;
     cmd = (WCHAR *)malloc(n * sizeof(WCHAR));
+    if (cmd && !(for_update ? cu_launcher_command(line, cmd, n) : cu_reopen_command(line, cmd, n))) {
+        free(cmd);
+        cmd = NULL;
+    }
     if (cmd) {
-        swprintf(cmd, n, L"%ls --launcher", line);
         memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
         PROCESS_INFORMATION again;
         if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, g_start_env ? CREATE_UNICODE_ENVIRONMENT : 0,
                            g_start_env, g_start_dir[0] ? g_start_dir : NULL, &si, &again)) {
-            fprintf(stderr, "[UI] the game closed%s: the launcher opens again\n",
-                    update ? " with an update waiting" : "");
+            fprintf(stderr, "[UI] the game closed%s: the launcher opens again%s\n",
+                    update ? " with an update waiting" : "", for_update ? " for UPDATE NOW" : "");
             fflush(stderr);
             CloseHandle(again.hThread);
             CloseHandle(again.hProcess);
         }
         free(cmd);
     }
-    GetExitCodeProcess(pi.hProcess, &code);
-    ExitProcess(code);
+    ExitProcess(for_update ? 0 : code);
 }
 #endif
 

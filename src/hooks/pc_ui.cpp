@@ -41,6 +41,8 @@
 #include "pc_ui_actions.h"
 #include "pc_launcher_home.h"
 #include "pc_content.h"
+#include "content_update.h"
+#include "content_release.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"     // SetKeyOwner: F9's box keeps the keys from the screens under it
@@ -71,6 +73,7 @@ extern "C" {
 #include "bug_report.h"
 #include "voice.h"
 #include "online_screen.h"
+#include "rts_social_rules.h"
 #include "hd_build.h"
 #include "updater.h"
 
@@ -2775,7 +2778,7 @@ static void quality_widget()
                           "next time the game starts.");
 }
 
-// The online server (build 30; build 38: three relays): Automatic, Europe, US East or US West, each with
+// The online server (build 30; build 38: three relays): Automatic, Europe, US East or Asia, each with
 // its ping and players as the relays answer (netplay_servers.c), or All servers. A custom address
 // (Advanced, Online) shows as such.
 static std::string server_line(const NetServerInfo &s)
@@ -2820,7 +2823,7 @@ static void server_widget()
     ImGui::SetItemTooltip("Where you play online. Automatic takes the server with the lowest ping when you go online. "
                           "Quick Match looks on your server first, then (when nobody is there) on the other US server "
                           "after 10 s and on every server after 30 s; accounts and stats are shared. All servers: the "
-                          "rooms of Europe, US East and US West in one list; matches across the ocean have higher ping.");
+                          "rooms of Europe, US East and Asia in one list; matches across the ocean have higher ping.");
 }
 
 static void page_basics()
@@ -3366,6 +3369,8 @@ static UiResult draw_launcher(float x, float y, float width, float height)
         bool pressed = glass_button("##play", g_content_play_waiting ? (g_content_play_skip ? "WAIT" : "PLAY NOW") : "PLAY",
                                     at(48, 498), ImVec2(270 * s, 64 * s), s, GLASS_RED, display_font(), 36 * s,
                                     !busy && !g_content_play_skip);
+        // build 86: started by the game's UPDATE NOW: PLAY by itself, which waits for the sync (and its compose)
+        if (!busy && content_update_auto_play()) pressed = true;
         if (content_play_gate(pressed)) result.play = true;
     }
     // Four small buttons under PLAY (61.5 wide, 8 apart).
@@ -3704,8 +3709,10 @@ std::atomic<bool> g_toggle(false);
 std::atomic<bool> g_note_shown(false);  // F9's "What's wrong?" box is up (pc_ui_report_ask)
 bool g_online = false;              // the overlay shows the online screens (the main menu's ONLINE)
 bool g_exit = false;                // the overlay shows the main menu's QUIT FFNY ONLINE? prompt
+bool g_cupd = false;                // build 86: the main menu's "New community content is out" popup
 std::atomic<bool> g_exit_req{false};    // ESC or a click on the EXIT chip (window thread)
 bool g_ms = false;                  // the overlay shows MILESTONES (the user-ID screen, the Story crib)
+bool g_community = false;           // the overlay shows the community window (MORE on a select screen)
 bool g_skin = false;                // build 85: the overlay shows the skin window over a select screen
 std::atomic<bool> g_ms_req{false};      // a click on the MILESTONES chip (window thread)
 std::atomic<int> g_menu_eats_back{0};   // the title reads no BACK (VIEW) on the main menu (game thread)
@@ -3825,7 +3832,7 @@ void set_open(bool open)
     if (g_open.load() == open) return;
     g_open = open;
     g_just_opened = open;
-    if (!open) g_online = g_exit = g_ms = g_skin = false;
+    if (!open) g_online = g_exit = g_ms = g_skin = g_cupd = g_community = false;
     if (open) { g_hold_input = false; xbox_HostInputSetUiActive(1); }
     else g_hold_input = true;           // released in release_input_when_idle
 #if !defined(_WIN32)
@@ -4222,6 +4229,9 @@ struct NoteOffer {
 };
 static NoteOffer g_offer;
 static std::atomic<bool> g_offer_visible(false), g_offer_key(false);
+// build 86.1: the fight chat's hold on the window's keys and clicks, set once a frame (pc_ui_window_message, rts_chat_route)
+static std::atomic<int> g_fc_keys(0);
+static std::atomic<bool> g_fc_typing(false);
 static const UiTick OFFER_MS = 20000;
 
 // Called each frame under the lock, before F9's box opens: whether the line shows this frame.
@@ -4415,6 +4425,24 @@ extern "C" void pc_ui_apply_settings(void)
 }
 
 #if defined(_WIN32)
+// The kind of a window message for the fight chat's routing (rts_chat_route).
+static int fight_chat_msg_kind(UINT msg)
+{
+    switch (msg) {
+    case WM_KEYDOWN: return RTS_MSG_KEYDOWN;
+    case WM_SYSKEYDOWN: return RTS_MSG_SYSKEYDOWN;
+    case WM_KEYUP: case WM_SYSKEYUP: return RTS_MSG_KEYUP;
+    case WM_CHAR: return RTS_MSG_CHAR;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: case WM_MBUTTONDBLCLK: case WM_XBUTTONDBLCLK:
+        return RTS_MSG_MOUSEDOWN;
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP: return RTS_MSG_MOUSEUP;
+    case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: case WM_SETFOCUS: case WM_KILLFOCUS:
+        return RTS_MSG_MOUSEMOVE;     // the overlay keeps track; the game sees them as before
+    default: return RTS_MSG_OTHER;
+    }
+}
+
 extern "C" int pc_ui_window_message(HWND window, UINT msg, WPARAM wp, LPARAM lp)
 {
     // F9's "What's wrong?" box takes the typing; another F9 and the overlay key wait until it is closed.
@@ -4474,6 +4502,31 @@ extern "C" int pc_ui_window_message(HWND window, UINT msg, WPARAM wp, LPARAM lp)
             return 1;
         }
     }
+    // The fight chat with the online screens shut (build 86.1; before, only the pad's button, polled, opened it): the
+    // Run the Streets dock or a spectator's bar sees the keys and clicks; ENTER, a click on the chat and, while it
+    // is typed in, every press stay the chat's (rts_chat_route). Releases always reach the game.
+    if (!note && !g_open.load() && g_fc_keys.load() != RTS_CHAT_NONE) {
+        int kind = fight_chat_msg_kind(msg), route = 0;
+        if (kind == RTS_MSG_OTHER) return 0;
+        ui_lock();
+        if (g_ready) {
+            bool in_chat = kind == RTS_MSG_MOUSEDOWN &&
+                           online_screen::fight_chat_at((float)(short)LOWORD(lp), (float)(short)HIWORD(lp));
+            route = rts_chat_route(g_fc_keys.load(), g_fc_typing.load() ? 1 : 0, kind, (int)wp, in_chat ? 1 : 0);
+            if (kind == RTS_MSG_MOUSEDOWN)
+                fprintf(stderr, "[UI] fight chat: click at %d,%d%s\n", (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
+                        in_chat ? " on the chat (kept from the game)" : "");
+            if (route & RTS_ROUTE_UI) {
+                // a click carries its own position: the overlay may have had no WM_MOUSEMOVE over the fight (or a
+                // WM_MOUSELEAVE after it), and the dock's hit test reads io.MousePos
+                if (kind == RTS_MSG_MOUSEDOWN || kind == RTS_MSG_MOUSEUP)
+                    ImGui::GetIO().AddMousePosEvent((float)(short)LOWORD(lp), (float)(short)HIWORD(lp));
+                ImGui_ImplWin32_WndProcHandler(window, msg, wp, lp);
+            }
+        }
+        ui_unlock();
+        return (route & RTS_ROUTE_KEEP) ? 1 : 0;
+    }
     if (!g_open.load() && !note) return 0;
     ui_lock();
     int handled = 0;
@@ -4529,6 +4582,7 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
     if (!ui_capturing() && !g_chords.empty() && pad_toggle_pressed()) toggled = true;
     if (toggled && !g_note.open) set_open(!g_open.load());
     release_input_when_idle();
+    content_update_frame(g_online ? 1 : 0);      // build 86: the content check in any menu; UPDATE NOW taken
     if (online_screen::take_open_request()) {      // ONLINE chosen in the game's main menu
         set_open(true);
         g_online = true;
@@ -4555,6 +4609,14 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         if (!g_open.load() && !g_note.open && !toggled && online_screen::take_skin_window_request()) {
             set_open(true);
             g_skin = true;
+        } else if (!g_open.load() && !g_note.open && !toggled && content_update_offer_due(online_screen::exit_wanted())) {
+            // build 86: new community content: once per news on the main menu, and after each fight
+            set_open(true);
+            g_cupd = true;
+            online_screen::update_prompt_begin("main menu");
+        } else if (!g_open.load() && !g_note.open && !toggled && online_screen::take_community_window_request()) {
+            set_open(true);
+            g_community = true;
         } else if (!g_open.load() && !g_note.open && !toggled && online_screen::exit_wanted() &&
             (req || view_press || online_screen::take_exit_test_request())) {
             set_open(true);
@@ -4585,6 +4647,8 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
     bool mschip = !g_open.load() && !versus && !decor && online_screen::milestones_wanted();
     // Build 76: the input delay line over an online fight (delay_hud_ui.inc), drawing only
     bool delayhud = !g_open.load() && !versus && !decor && !hillhud && online_screen::delay_hud_wanted();
+    // Run the Streets: chat bubbles and speaker icons over the fighters (rts_social_ui.inc), drawing only
+    bool rtsworld = !g_open.load() && !versus && !decor && online_screen::rts_world_wanted();
     static bool fc_held;
     auto fight_chat_hold = [&](bool typing) {
         if (typing && !fc_held) {
@@ -4599,13 +4663,22 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         }
     };
     fight_chat_hold(fightchat && online_screen::fight_chat_typing());
+    // build 86.1: the window's keys and clicks reach the fight chat too (pc_ui_window_message)
+    g_fc_keys = fightchat ? online_screen::fight_chat_keys() : RTS_CHAT_NONE;
+    g_fc_typing = fightchat && online_screen::fight_chat_typing();
     char notice[160];
     // F9's notice shows over everything, the online screens and the settings included (pressed in
     // the online menu, it was hidden there); the netplay notices are for the fight only.
     bool toast = bug_report_toast(notice, sizeof(notice)) ||
                  (!g_open.load() && netplay_toast(notice, sizeof(notice))) ||  // online: a wait, a desync
                  (!g_open.load() && online_screen::milestone_toast(notice, sizeof(notice))) ||  // a milestone reached
-                 update_notice(notice, sizeof(notice));                         // a newer build is out
+                 update_notice(notice, sizeof(notice)) ||                       // a newer build is out
+                 // build 86: new community content, in any menu (the online screens say it themselves)
+                 content_update_toast(notice, sizeof(notice), !g_open.load() && !netplay_in_fight() && !netplay_active()) ||
+                 // build 87: content to come at the next release window ("New content at 17:00 ..."), on the main
+                 // menu (the online pages have its badge): the answer often comes during the intro, where a notice
+                 // of 12 s would be over before anyone reads it
+                 content_release_toast(notice, sizeof(notice), !g_open.load() && online_screen::exit_wanted());
     // F9's picture is taken this frame: without the notice F9 itself put up ("taking a picture"), which
     // would cover the screen being reported. With nothing else drawn, the game's frame stays the picture.
     bool report = g_report_pending.exchange(false);
@@ -4618,7 +4691,8 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
     if (g_note.open) toast = false;     // F9's "taking a picture" would sit over the box
     char talk[160];
     bool talking = voice_overlay(talk, sizeof(talk)) != 0;               // voice chat: who talks
-    if (!g_open.load() && !decor && !versus && !toast && !talking && !g_note.open && !fightchat && !hillhud && !hillres && !fighthud && !delayhud && !mschip && !offer) { ui_unlock(); return; }
+    if (rtsworld) talking = false;      // Run the Streets: the speaker icons over the fighters say it (and the dock is there)
+    if (!g_open.load() && !decor && !versus && !toast && !talking && !g_note.open && !fightchat && !hillhud && !hillres && !fighthud && !delayhud && !mschip && !offer && !rtsworld) { ui_unlock(); return; }
 
     ID3D11Device *dev = (ID3D11Device *)device;
     ID3D11DeviceContext *ctx = (ID3D11DeviceContext *)context;
@@ -4667,6 +4741,15 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         if (g_note.open ? false : !online_screen::draw_milestones(io.DisplaySize)) close_request = true;
     } else if (g_skin) {
         if (!g_note.open && online_screen::draw_skin_window(io.DisplaySize)) close_request = true;
+    } else if (g_cupd) {
+        // 0 open, 1 LATER, 2 UPDATE NOW (taken: the game closes), 3 the main menu went away
+        int answer = g_note.open ? 0 : online_screen::draw_update_prompt(io.DisplaySize, true);
+        if (answer) {
+            content_update_offer_answer(answer == 1);
+            close_request = true;
+        }
+    } else if (g_community) {
+        if (!g_note.open && online_screen::draw_community_window(io.DisplaySize)) close_request = true;
     } else if (g_exit) {
         int answer = g_note.open ? 0 : online_screen::draw_exit_prompt(io.DisplaySize);
         if (answer == 2 && g_window) {
@@ -4729,6 +4812,7 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
             if (logged++ < 20) fprintf(stderr, "[SOCIAL] caught: an exception (hill results strip)\n");
         }
     }
+    if (rtsworld) online_screen::draw_rts_world(ImGui::GetForegroundDrawList(), io.DisplaySize);
     if (fightchat) fight_chat_hold(online_screen::draw_fight_chat(ImGui::GetForegroundDrawList(), io.DisplaySize));
     if (talking) {  // small, bottom left, over everything
         ImDrawList *fg = ImGui::GetForegroundDrawList();

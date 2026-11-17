@@ -18,7 +18,7 @@ enum ChatTab { TAB_ROOM, TAB_GLOBAL, TAB_FRIENDS, TAB_ONLINE, TAB_MESSAGES, TAB_
 const char *const k_tab_names[TAB_COUNT] = { "ROOM", "GLOBAL", "FRIENDS", "ONLINE", "MESSAGES", "CREW" };
 const char *const k_tab_shots[TAB_COUNT] = { "social-room", "social-global", "social-friends", "social-online", "social-messages",
                                              "social-crew" };
-const char *const k_region_ids[4] = { "", "eu", "us-east", "us-west" };
+const char *const k_region_ids[4] = { "", "eu", "us-east", "sg" };
 const char *const k_region_names[4] = { "ALL SERVERS", "EUROPE", "US EAST", "US WEST" };
 
 const ImU32 GOLD_TEXT = IM_COL32(255, 205, 60, 255), BLUE_NAME = IM_COL32(142, 199, 255, 255),
@@ -99,6 +99,13 @@ struct Chat {
 } C;
 
 bool chat_mouse_blocked() { return C.mouse_off; }
+
+// Run the Streets' docked chat (rts_social_ui.inc) takes the fight chat's place in its fights, with this state (FC)
+bool rts_dock_live();
+bool rts_dock_draw(ImDrawList *dl, ImVec2 display);
+void rts_dock_send();
+void rts_dock_gone();
+const char *rts_dock_target();
 
 // ---- the quick-chat wheel (the Social Update; the owner's approved design "Quick chat wheel") ----
 //
@@ -456,12 +463,12 @@ std::string ago_text(long long unix_s)
 
 std::string region_label(const std::string &relay)
 {
-    return relay == "eu" ? "Europe" : relay == "us-east" ? "US East" : relay == "us-west" ? "US West" : "";
+    return relay == "eu" ? "Europe" : relay == "us-east" ? "US East" : relay == "sg" ? "Asia (Singapore)" : "";
 }
 
 int server_of_region(const std::string &relay)
 {
-    return relay == "eu" ? NETSERVER_EU : relay == "us-east" ? NETSERVER_NA : relay == "us-west" ? NETSERVER_WEST : -1;
+    return relay == "eu" ? NETSERVER_EU : relay == "us-east" ? NETSERVER_NA : relay == "sg" ? NETSERVER_WEST : -1;
 }
 
 // What a friend does, as the FRIENDS list says it, and its colour.
@@ -934,7 +941,7 @@ void draw_global(ImDrawList *dl, const Frame &f, const ChatKeys &k)
     std::string where = C.region ? std::string(k_region_names[C.region]) : "";
     for (auto &c : where) c = (char)tolower((unsigned char)c);
     std::string ph = C.region == 0 ? "Message everyone on your server" : "Message everyone on " +
-                     std::string(C.region == 1 ? "Europe" : C.region == 2 ? "US East" : "US West");
+                     std::string(C.region == 1 ? "Europe" : C.region == 2 ? "US East" : "Asia (Singapore)");
     input_bar(dl, f, PX, ph, "SEND");
 }
 
@@ -944,7 +951,7 @@ void open_keyboard(int kind);       // the on-screen keyboard, below
 
 std::string region_name(const std::string &r)
 {
-    return r == "eu" ? "Europe" : r == "us-east" ? "US East" : r == "us-west" ? "US West" : r;
+    return r == "eu" ? "Europe" : r == "us-east" ? "US East" : r == "sg" ? "Asia (Singapore)" : r;
 }
 
 std::string month_year(long long unix_s)
@@ -2506,7 +2513,7 @@ void draw_keyboard(ImDrawList *dl, const Frame &f, ImVec2 display)
     std::string who, head;
     if (C.kb_kind == KB_FRIEND) { head = "ADD FRIEND"; who = ""; }
     else if (C.kb_kind == KB_CREW_INVITE) { head = "INVITE TO"; who = C.v.crew_name; }
-    else if (C.kb_kind == KB_FIGHT) { head = "MESSAGE TO"; who = "the room"; }
+    else if (C.kb_kind == KB_FIGHT) { head = "MESSAGE TO"; who = rts_dock_live() ? rts_dock_target() : "the room"; }
     else if (C.kb_kind == KB_CREW_NAME) { head = "NEW CREW - ITS NAME"; who = ""; }
     else if (C.kb_kind == KB_CREW_TAG) { head = "NEW CREW - ITS TAG"; who = C.crew_new_name; }
     else if (C.kb_kind == KB_QUICK) { head = "QUICK CHAT - LINE"; who = std::to_string(QW.editing + 1); }
@@ -3597,6 +3604,7 @@ int &fight_cursor() { return FC.cursor; }
 // Sends the bar's line (ENTER, or SEND on the on-screen keyboard) and closes the bar.
 void fight_send()
 {
+    if (rts_dock_live()) { rts_dock_send(); return; }     // Run the Streets: the dock's tab, which stays open
     std::string t = FC.draft;
     while (!t.empty() && t.back() == ' ') t.pop_back();
     if (t.size() > 200) {
@@ -3640,8 +3648,11 @@ bool fight_chat_wanted_impl()
         FC.fight_at = 0;
         if (C.kb && C.kb_kind == KB_FIGHT) C.kb = false;
         if (QW.where == QW_FIGHT) quick_close("the match is over");
+        rts_dock_gone();
         return false;
     }
+    if (rts_dock_live()) return true;       // Run the Streets: the docked chat, always (its chip at the least)
+    rts_dock_gone();
     quick_test_tick();
     if (FC.typing) return true;
     NetRoom r;
@@ -3713,6 +3724,7 @@ void fight_chat_test(const NetRoom &r)
 // Draws the lines (and a spectator's bar); returns true while the bar takes the keyboard.
 bool fight_chat_draw_impl(ImDrawList *dl, ImVec2 display)
 {
+    if (rts_dock_live()) return rts_dock_draw(dl, display);
     Frame f = menu_frame(display);
     NetRoom r;
     lobby_room(&r);

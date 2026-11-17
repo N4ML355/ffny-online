@@ -45,14 +45,16 @@ import re
 import shutil
 import struct
 
-from ffnycontent import clothing, cpparts, delta, fighterart, loc, newfighter, newvenue, viv
+from ffnycontent import clothing, cpparts, delta, fighterart, loc, newfighter, newvenue, unlimited, viv
+from ffnycontent import sod as sodmod
 
 SCHEMA = 1
-COMPOSER = 8                    # bump when the output for the same inputs changes (8: row names just above the top)
+COMPOSER = 10                   # bump when the output for the same inputs changes (10: build 86 = banks, official maps, fighter_light)
 NEW_DAYS = 14                   # a new fighter's select thumbs carry NEW for this long after its review
 HUB_ART = ('online-art', 'fighters')    # <data>/online-art/fighters/<feID>.png: the online hub's portraits
 SKIN_ART = ('online-art', 'skins')      # <data>/online-art/skins/<pack id>.png: a skin's picture in the skin window
 TYPES = ('fighter-body', 'clothing', 'venue', 'new-fighter')
+ALWAYS_ON = ('content', 'official-map')     # kinds the player cannot switch off
 OUT = 'content-files'
 LANG_DIR = 'lang'               # content-files/lang/<language pack>/<P>: the packs on top of that translation
 LANG_MAX = 8                    # language packs composed with (each costs a copy of the files it covers)
@@ -305,13 +307,14 @@ class Work:
         self.bases = bases
         self.loose = {}             # path key -> [path, bytes]
         self.archives = {}          # path key -> [path, {entry key: [name, bytes]}, [[name, bytes]]]
+        self.logical = []           # records of the fighters beyond the places (unlimited.add_records), in order
 
     def snapshot(self):
         return ({k: list(v) for k, v in self.loose.items()},
-                {k: [v[0], dict(v[1]), list(v[2])] for k, v in self.archives.items()})
+                {k: [v[0], dict(v[1]), list(v[2])] for k, v in self.archives.items()}, list(self.logical))
 
     def restore(self, snap):
-        self.loose, self.archives = snap
+        self.loose, self.archives, self.logical = snap
 
     def _archive(self, rel):
         key = rel.lower()
@@ -383,7 +386,7 @@ def fighter_place(op, fe_id):
     """A new fighter's front-end ID: the signed catalogue's (``fighter_fe_id``, the account service's place for
     the pack: the same for every player), else the op's own (a pack installed by hand or tested from Studio)."""
     place = fe_id if fe_id else op.get('fe_id')
-    if not isinstance(place, int) or isinstance(place, bool):
+    if not isinstance(place, int) or isinstance(place, bool) or place == newfighter.MORE_ID:
         raise ComposeError('this new fighter has no place in the roster yet (the catalogue gives none)')
     return place
 
@@ -417,9 +420,16 @@ def pack_reader(folder):
 
 def apply_new_fighter(work, op, fe_id, folder=None, new=False):
     pack = pack_reader(folder) if folder is not None else None
-    for where, rel, entry, data in newfighter.apply_op(FighterFiles(work), op, fighter_place(op, fe_id), pack=pack,
-                                                       new=new):
-        if where == 'loose':
+    place = fighter_place(op, fe_id)
+    logical = newfighter.is_logical(place)
+    if logical and any(r['id'] == place for r in work.logical):
+        raise ComposeError('the community fighter %d is there already' % place)
+    for where, rel, entry, data in newfighter.apply_op(FighterFiles(work), op, place, pack=pack, new=new,
+                                                       logical=logical,
+                                                       taken_models=[r['model'] for r in work.logical]):
+        if where == 'logical':
+            work.logical.append(data)
+        elif where == 'loose':
             work.set_loose(rel, data)
         elif where == 'replace':
             work.replace(rel, entry, data)
@@ -477,10 +487,11 @@ def apply_skin(work, op, skin_of=None):
     return template_fe_id, model, op['name']
 
 
-def apply_pack(work, folder, info, fe_id=None, new=False, skin=False, skin_of=None):
+def apply_pack(work, folder, info, fe_id=None, new=False, skin=False, skin_of=None, rts=False):
     """One pack's ops (first, on the files as the earlier packs left them) and entries; raises on any failure.
     ``fe_id``: a new-fighter pack's place from the signed catalogue; ``new``: its select thumbs carry NEW;
-    ``skin``: the team accepted the new fighter as a skin of its template (``skin_of``, ``apply_skin``)."""
+    ``skin``: the team accepted the new fighter as a skin of its template (``skin_of``, ``apply_skin``);
+    ``rts``: an official Run the Streets map (build 86): its venue is left out of Battle mode's venue select."""
     clothing_ops = [op for op in info.get('ops', []) if op['op'] in CLOTHING_OPS]
     if clothing_ops:
         tables = {}
@@ -510,6 +521,8 @@ def apply_pack(work, folder, info, fe_id=None, new=False, skin=False, skin_of=No
         venue_xml, entity_xml, sod_blob = newvenue.apply(work.current(newvenue.VENUE_XML),
                                                          work.current(newvenue.ENTITY_XML),
                                                          work.current(clothing.SOD_PATH), op, taken)
+        if rts:
+            sod_blob = sodmod.set_venue_modes(sod_blob, int(op['fe_id']), 0)
         work.set_loose(newvenue.VENUE_XML, venue_xml)
         work.set_loose(newvenue.ENTITY_XML, entity_xml)
         work.set_loose(clothing.SOD_PATH, sod_blob)
@@ -655,12 +668,18 @@ def settle_places(packs, reserved=(), log=print):
     order = list(newfighter.PLACE_ORDER)
     valid = set(order)
     fighters = []
+    beyond = False
     for p in packs:
         op = new_fighter_op(p['folder']) if p.get('folder') else None
         if op is not None:
             place = p.get('fighter_fe_id') or op.get('fe_id')
+            if newfighter.is_logical(place):
+                beyond = True       # a community fighter beyond the places: no place, it needs the banks
+                continue
             fighters.append((p, place if isinstance(place, int) and not isinstance(place, bool) else None))
     taken = {r for r in reserved if r in valid}
+    if beyond:
+        taken |= set(unlimited.BANKS)   # an own pack does not move onto a bank (a community pack there: finish_logical)
     owner = {}
     for p, place in fighters:
         if p.get('local'):
@@ -704,14 +723,48 @@ def run_packs(bases, chosen, log, new=()):
             if p.get('place_problem'):
                 raise ComposeError(p['place_problem'])
             info = read_install(p['folder'])
-            apply_pack(work, p['folder'], info, p.get('fighter_fe_id'), p['id'] in new, is_skin(p), p.get('skin_of'))
+            apply_pack(work, p['folder'], info, p.get('fighter_fe_id'), p['id'] in new, is_skin(p), p.get('skin_of'),
+                       bool(p.get('rts_map')))
             applied.append(p)
         except PACK_ERRORS + (cpparts.PartsError, loc.LocError, newfighter.FighterError) as error:
             work.restore(snap)
             reason = str(error) if not isinstance(error, KeyError) else 'not found: %s' % error.args[0]
             skipped.append((p['id'], reason))
             log('[compose] %s skipped: %s' % (p['id'], reason))
+    if work.logical:
+        finish_logical(work, applied, skipped, log)
     return work, applied, skipped
+
+
+def finish_logical(work, applied, skipped, log):
+    """The community fighters beyond the places into the database: the four bank rows, their unindexed records
+    and the side file (``unlimited.py``). When the banks cannot go in (a place fighter at 124..127) every such
+    fighter is left out, with the reason."""
+    try:
+        sod, side = unlimited.add_records(work.current(newfighter.SOD_PATH), work.logical)
+    except newfighter.FighterError as error:
+        ids = {r['id'] for r in work.logical}
+        for p in list(applied):
+            op = new_fighter_op(p['folder']) if p.get('folder') else None
+            if op is not None and fighter_place(op, p.get('fighter_fe_id')) in ids:
+                applied.remove(p)
+                skipped.append((p['id'], str(error)))
+                log('[compose] %s skipped: %s' % (p['id'], error))
+        work.logical = []
+        return
+    work.set_loose(newfighter.SOD_PATH, sod)
+    work.set_loose(unlimited.SIDE_FILE, side)
+    # the banks' own pictures (Doc's, as placeholders): the screens open a bank's pictures by its ID, and the game
+    # loads the bound fighter's in their place (src/hooks/fighter_bank_hooks.c, the movie loader)
+    files = FighterFiles(work)
+    there = {n.lower() for n in files.names(newfighter.SCREENS_ARCHIVE)}
+    for fe in unlimited.BANKS:
+        for name, data in newfighter.picture_copies(newfighter._View(files, newfighter.SCREENS_ARCHIVE),
+                                                    unlimited.BANK_TEMPLATE, fe):
+            if name.lower() not in there:
+                work.add(newfighter.SCREENS_ARCHIVE, name, data)
+                there.add(name.lower())
+    log('[compose] %d community fighters beyond the places (banks 124..127)' % len(work.logical))
 
 
 def run_whole(bases, chosen, log, new=()):
@@ -805,7 +858,8 @@ def inputs_key(game, packs, off, languages=(), new=()):
     raw = json.dumps([COMPOSER, str(Path(game).resolve()),
                       [[p['id'], p['version'], p['content_sha256'], p.get('fighter_fe_id', 0)]
                        + ([p['bundle']] if p.get('bundle') else []) + (['left out'] if p.get('place_problem') else [])
-                       + (['skin', p.get('skin_of')] if is_skin(p) else []) for p in packs],
+                       + (['skin', p.get('skin_of')] if is_skin(p) else []) + (['rts'] if p.get('rts_map') else [])
+                       for p in packs],
                       sorted(off),
                       [[lang['id'], lang['stamp']] for lang in languages],
                       sorted(new)])
@@ -847,7 +901,9 @@ def hub_portraits(data, packs, template, known=()):
             if not ops:
                 continue
             place = fighter_place(ops[0], p.get('fighter_fe_id'))
-            if not newfighter.is_place(place) or place in dict(there):
+            # build 86: a community fighter beyond the places has one too, under its number (the hub's picker,
+            # the room card and the versus screen show it online)
+            if not (newfighter.is_place(place) or newfighter.is_logical(place)) or place in dict(there):
                 continue
             path = folder / ('%d.png' % place)
             if (place, p['id']) not in known or not path.is_file():
@@ -865,9 +921,13 @@ def hub_portraits(data, packs, template, known=()):
         except PACK_ERRORS:
             continue                        # no body art, or art the composer refused: no portrait
     keep = {place for place, _ in there}
-    for place in newfighter.PLACES:
-        path = folder / ('%d.png' % place)
-        if place not in keep and path.is_file():
+    stale = [folder / ('%d.png' % place) for place in newfighter.PLACES if place not in keep]
+    if folder.is_dir():     # a number's portrait whose pack is gone (stock portraits are below 1000)
+        for path in folder.glob('*.png'):
+            if path.stem.isdigit() and newfighter.is_logical(int(path.stem)) and int(path.stem) not in keep:
+                stale.append(path)
+    for path in stale:
+        if path.is_file():
             try:
                 path.unlink()
             except OSError:
@@ -952,7 +1012,8 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None, t
     off = read_off(data) if off is None else set(off)
     recover(root)
     packs = sorted(packs, key=lambda p: (p.get('order', 1 << 30), p['id']))
-    switched = sorted(p['id'] for p in packs if p.get('kind') != 'content' and p['id'] in off)
+    # content packs and the FFNY team's official maps (build 86) are always on; only replacements switch off
+    switched = sorted(p['id'] for p in packs if p.get('kind') not in ALWAYS_ON and p['id'] in off)
     chosen = [p for p in packs if p['id'] not in switched]
     settle_places(chosen, reserved, log)
     languages = language_packs(data, off, log) if languages is None else list(languages)

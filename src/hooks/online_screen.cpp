@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "rts.h"
 #include "imgui_internal.h"      // GetKeyData: the quick-chat wheel reads the sticks
 #include "online_screen.h"
 #include "netplay.h"
@@ -55,13 +56,20 @@
 #include "updater.h"
 #include "social.h"
 #include "fight_hud.h"
+#include "openworld.h"
+#include "rts_social.h"
+#include "rts_social_rules.h"
 #include "fight_hud_rules.h"
 #include "start_countdown.h"
 #include "milestones.h"
 #include "season_search.h"
 #include "fighter_skins.h"
+#include "fighter_banks.h"
+#include "new_fighters.h"
 #include "pc_content.h"
 #include "pc_mods.h"
+#include "content_update.h"
+#include "content_release.h"
 #include "music_library.h"
 #include "pc_launcher_music.h"
 #include <time.h>
@@ -93,6 +101,7 @@ extern "C" void online_menu_on_funccall(const char *text)
         // case: the dump writes both story/crib and Story/Crib
         g_ms_screen = strstr(text, "options/battleID") ? 1 : (strstr(text, "tory/crib") || strstr(text, "tory/Crib")) ? 2 : 0;
         int up = strstr(text, "intMain/mainMenu") != nullptr;
+        if (up) rts_main_menu();      // Run the Streets: the offline fights' rules end at the main menu
         // A hub match's summary leads to the battle match-type screen: the room comes back
         // instead of that menu (the match is still "connected" at this point; automatch then
         // returns the session to the room).
@@ -461,6 +470,7 @@ float hint(ImDrawList *dl, const Frame &f, float x, float y, const char *button,
 
 int content_news(char *names, int size);
 bool content_problem(char *out, int size);
+bool content_release(char *head, int head_size, char *detail, int detail_size);
 // The page title in the corner, as the game writes MAIN MENU.
 void page_title(ImDrawList *dl, const Frame &f, const char *title)
 {
@@ -488,7 +498,18 @@ void page_title(ImDrawList *dl, const Frame &f, const char *title)
         float w = text_width(f, g_title, 12, line);
         rect(dl, f, 606 - w - 10, 8, w + 20, 20, IM_COL32(150, 14, 30, 230), 4);
         text(dl, f, g_title, 12, 606, 11, WHITE, line, RIGHT, 1.0f);
-        text(dl, f, g_hand, 11, 606, 30, ORANGE, "close the game, start it from the launcher", RIGHT, 0.8f);
+        text(dl, f, g_hand, 11, 606, 30, ORANGE, "UPDATE NOW on the hub (Y): the game comes back by itself", RIGHT, 0.8f);
+    } else {
+        // build 87: community content to come (the daily release window): when, on this PC's clock, and what;
+        // nothing to do yet, so it comes last. Once its time has passed, the notice above takes over.
+        char head[64], detail[224];
+        if (content_release(head, sizeof(head), detail, sizeof(detail))) {
+            float w = text_width(f, g_title, 12, head);
+            rect(dl, f, 606 - w - 10, 8, w + 20, 20, IM_COL32(150, 14, 30, 230), 4);
+            text(dl, f, g_title, 12, 606, 11, WHITE, head, RIGHT, 1.0f);
+            float size = std::max(8.0f, fit_size(f, g_hand, 11, detail, 330));
+            text(dl, f, g_hand, size, 606, 30, ORANGE, detail, RIGHT, 0.8f);
+        }
     }
 }
 
@@ -562,7 +583,13 @@ void silhouette(ImDrawList *dl, const Frame &f, float x, float y, float w, float
 bool portrait(ImDrawList *dl, const Frame &f, int id, float x, float y, float w, float h, ImU32 tint = IM_COL32_WHITE)
 {
     if (id == NETPLAY_CREATED_FIGHTER) { silhouette(dl, f, x, y, w, h, tint); return true; }
-    const Tex &t = fighter_tex(id);
+    const Tex *own = &fighter_tex(id);
+    if ((!own->srv || own->w <= 0 || own->h <= 0) && id >= FB_FIRST_LOGICAL) {
+        // build 86: a community fighter beyond the places without a hub portrait of its own: its template's
+        const FighterBanksEntry *e = fighter_banks_find(id);
+        if (e) own = &fighter_tex(e->template_fe_id);
+    }
+    const Tex &t = *own;
     if (!t.srv || t.w <= 0 || t.h <= 0) return false;
     float v = std::min(1.0f, (t.w / t.h) / (w * f.sx / (h * f.sy)));
     return image(dl, f, t, x, y, w, h, tint, ImVec2(0, 0), ImVec2(1, v));
@@ -902,12 +929,16 @@ std::string upper(const char *s)
 // ---- the screens --------------------------------------------------------------------------------
 
 enum Page { HUB, ROOMS, SETTINGS, FIGHTERS, CODE, STATS, PLAYERS, RANKED, VOICE, SERVERS, NAME, RANKED_MODES, RANKED_RESULTS,
-            QUICK, LOCKER, RANKED_BOARD, TURF, MUSIC };
+            QUICK, LOCKER, RANKED_BOARD, TURF, MUSIC, RTS };
 
 struct State {
     Page page = HUB;
     bool settings_edit = false;     // SETTINGS changes the room's (host) instead of a new one
     bool ranked_pick = false;       // FIGHTERS picks the fighter for a ranked search
+    bool rts_pick = false;          // FIGHTERS picks the fighter for an offline Run the Streets fight
+    int rts_sel = 0, rts_cpus = 3;  // RUN THE STREETS: the chosen entry, the CPU fighters of VS CPU (2..3)
+    bool rts_setup = false;         // build 87: VS CPU's set-up (CPU fighters, TIME LIMIT, KO TARGET) is open
+    int rts_setup_sel = 0;
     int hub_sel = 0, rooms_sel = 0, settings_sel = 0, fighter_sel = 0, fighter_top = 0, vote_sel = 0, voice_sel = 0;
     int quick_mode = 0;             // index into online_modes
     int stats_page = 0;             // MY STATS: the leaderboard page
@@ -929,11 +960,15 @@ struct State {
     bool skin_open = false;
     int skin_fe = -1, skin_sel = 0, pick_skin = 0;
     ULONGLONG skin_opened = 0;
+    // build 86: the community window over CHOOSE FIGHTER (community_ui.inc), from the grid's MORE card
+    bool unl_open = false;
+    int unl_sel = 0;
+    ULONGLONG unl_opened = 0;
     uint32_t watch_hidden = 0;      // King of the Hill: the fight whose watching screen B closed
     unsigned long long give_up_at = 0, lb_since = 0;    // King of the Hill: LB gave up the spot; LB held since
     bool lb_long_done = false;      // the long LB press has acted
     // the server (netplay_servers.h)
-    int servers_sel = 0;            // SERVERS: 0 Automatic, 1 Europe, 2 US East, 3 US West, 4 All servers
+    int servers_sel = 0;            // SERVERS: 0 Automatic, 1 Europe, 2 US East, 3 Asia, 4 All servers
     bool connect_pending = false;   // Automatic waits for the relays' first answers before connecting
     bool fallback_tried = false;    // Automatic: another relay was tried once after a failed connection
     int auto_moves = 0;             // quick matches moved to another relay since QUICK MATCH
@@ -975,8 +1010,8 @@ struct Gallery {
     bool ranked = false;            // RANKED MATCH shown in the sample hub
     bool pending = false;           // the sample waits for the relays' first answers
     int room_pings[NETPLAY_ROOM_SLOTS] = {};
-    std::vector<NetServerRoom> other_rooms;     // All servers: the sample's rooms on US East and US West
-    std::vector<NetServerPlayer> other_players; // All servers: the sample's players on US East and US West
+    std::vector<NetServerRoom> other_rooms;     // All servers: the sample's rooms on US East and Asia
+    std::vector<NetServerPlayer> other_players; // All servers: the sample's players on US East and Asia
     NetVersus versus = {};          // the versus pages' sample (count 0: the plain MATCH FOUND)
     int page_ms = 0;                // how long the page has been up
     unsigned cp_slots = 0;          // created fighters: the sample's room slots that have one (0: none offered)
@@ -991,6 +1026,9 @@ struct Gallery {
     int room_rb[NETPLAY_ROOM_SLOTS] = {};   // each sample member's rollback byte (netplay_room_rollback)
     NetCrew crew = {};              // crew battles (stage 3): the crew-battle pages' sample (battle 0: none)
     bool my_crew = false;           // build 77: the hub shows MY CREW
+    unsigned original = 0;          // build 86: the sample's "Original fighters only" choices (bit per type, as the setting)
+    bool rts = false;               // build 86: the hub shows RUN THE STREETS (an account with access)
+    int rts_rules = 0;              // build 87: VS CPU's round rules on the gallery's pages (never the settings)
 } G;
 NetHillWatch G_hill_hud;            // build 70: the spectator HUD pages' sample (count 0: none)
 NetHillMenu G_hill_menu;            // build 73: the room menu pages' sample (results 0: not the results strip)
@@ -1199,6 +1237,22 @@ std::string max_ping_text(int ms)
 bool standard_only(int rules) { return (rules & NETPLAY_RULES_STANDARD) != 0; }
 bool content_switch_offered() { return rules_offered() && pc_content_print() != 0; }
 const char *content_text(int rules) { return standard_only(rules) ? "Off: standard only" : "On: new fighters, venues"; }
+// build 86: "Original fighters only" or "All fighters (community too)" where a search starts (Quick Match per type,
+// King of the Hill, FFA rotation, Ranked: NETPLAY_ORIGINAL_RANKED), remembered by netplay_original. The gallery
+// keeps its own.
+static int original_gallery_bit(int type) { return type == NETPLAY_ORIGINAL_RANKED ? 28 : type >= 0x40 ? 24 + (type - 0x40) : type; }
+bool search_original(int type)
+{
+    if (gallery_on()) return (G.original >> original_gallery_bit(type) & 1u) != 0;
+    return netplay_original(type) != 0;
+}
+void search_original_toggle(int type)
+{
+    bool on = !search_original(type);
+    if (gallery_on()) G.original ^= 1u << original_gallery_bit(type);
+    else netplay_set_original(type, on);
+}
+const char *original_words(bool original) { return original ? "ORIGINAL FIGHTERS ONLY" : "ALL FIGHTERS (COMMUNITY TOO)"; }
 // A pool may hold new venues when community content is on (and this PC has it: the venue list has them then).
 bool community_pool(const NetRoomSettings &s) { return !standard_only(s.fighter_rules); }
 // The small NEW badge (build 82) on a new fighter's card or a new venue's: a red tab with its top left at x, y.
@@ -1218,29 +1272,27 @@ float room_tag(ImDrawList *dl, const Frame &f, float right, float y, const char 
     return w;
 }
 // Build 82: new community content is out (pc_content_news, after the game's own catalogue check): the count of
-// changes, 0 none. The check runs when the hub opens and every ten minutes while an online page is up.
+// changes, 0 none. Build 86: the check runs every ten minutes in any menu while signed in, and on the online pages
+// (content_update_frame, from the overlay); the news is read every 3 s (content_update_news).
 int content_news(char *names, int size)
 {
-    if (gallery_on()) {     // the gallery: only its news page shows it (RECOMP_TEST_CONTENT_NEWS)
+    if (gallery_on()) {     // the gallery: only its news pages show it (RECOMP_TEST_CONTENT_NEWS)
         int n = G.page && !strcmp(G.page, "hub-news") ? pc_content_news(names, size) : 0;
         if (!n && names && size > 0) names[0] = 0;
         return n;
     }
-    static unsigned long long last_check;
-    unsigned long long now = GetTickCount64();
-    if (!gallery_on() && (!last_check || now - last_check > 10 * 60 * 1000ull)) {
-        last_check = now;
-        pc_mods_check_start();
+    return content_update_news(names, size);
+}
+// Build 87: community content is scheduled for the next release window (content_release.c): the notice's two
+// lines, "NEW CONTENT AT 17:00" and "3 new fighters, 1 skin - in 2h 15m". The gallery: its own page, a fixed sample.
+bool content_release(char *head, int head_size, char *detail, int detail_size)
+{
+    if (gallery_on()) {
+        if (!(G.page && !strcmp(G.page, "hub-release"))) return false;
+        content_release_sample_lines(head, head_size, detail, detail_size);
+        return true;
     }
-    static unsigned long long read_at;
-    static int cached;
-    static char cached_names[256];
-    if (!read_at || now - read_at > 3000) {
-        read_at = now;
-        cached = pc_content_news(cached_names, sizeof(cached_names));
-    }
-    if (names && size > 0) snprintf(names, (size_t)size, "%s", cached_names);
-    return cached;
+    return content_release_lines(head, head_size, detail, detail_size) != 0;
 }
 // Build 83: the last community content sync failed, or the game's own check did (pc_content_problem: sync-result.ini
 // and news.ini), as one plain line; read every 3 s. The gallery: only its own pages (RECOMP_TEST_CONTENT_SYNC).
@@ -1466,6 +1518,27 @@ Pad read_pad()
     p.lt = any({ ImGuiKey_GamepadL2 }, true);       // FIGHTERS: the previous first letter
     p.rt = any({ ImGuiKey_GamepadR2 }, true);       // FIGHTERS: the next first letter
     p.keys = true;
+    {   // tests: RECOMP_TEST_OVERLAY_PAD="r,r,a,..." presses these (u d l r a b x y) one at a time, 0.7 s apart,
+        // from 3 s after the first read: the online screens driven like a pad (Run the Streets' menu test)
+        static const char *script = (const char *)-1;
+        static unsigned long long t0, next;
+        if (script == (const char *)-1) script = getenv("RECOMP_TEST_OVERLAY_PAD");
+        if (script && *script) {
+            unsigned long long now = GetTickCount64();
+            if (!t0) { t0 = now; next = now + 3000; }
+            if (now >= next) {
+                while (*script == ',' || *script == ' ') script++;
+                char c = *script;
+                if (c) {
+                    script++;
+                    next = now + 700;
+                    p.up |= c == 'u'; p.down |= c == 'd'; p.left |= c == 'l'; p.right |= c == 'r';
+                    p.a |= c == 'a'; p.b |= c == 'b'; p.x |= c == 'x'; p.y |= c == 'y';
+                    fprintf(stderr, "[UI] test pad: %c (page %d)\n", c, (int)S.page);
+                }
+            }
+        }
+    }
     return p;
 }
 
@@ -1482,6 +1555,7 @@ const char *mode_name(int type)
 {
     if (NETPLAY_IS_KOTH(type)) return "King of the Hill";
     if (NETPLAY_IS_FFAROT(type)) return "FFA Rotation";
+    if (NETPLAY_IS_RTS(type)) return "Run the Streets";
     const OnlineMode *m = online_mode(type);
     return m ? m->name : "Match";
 }
@@ -1561,6 +1635,7 @@ int cycle_index(const std::vector<int> &cycle, int type)
 static int saved_fighter()
 {
     int id = online_fighter_id(recomp_settings_get("online", "fighter", 55));
+    if (id >= FB_FIRST_LOGICAL && !fighter_banks_find(id)) return 55;     // build 86: a community fighter no longer here
     return id == NETPLAY_CREATED_FIGHTER && !cp_available() ? 55 : id;
 }
 
@@ -1744,13 +1819,17 @@ void open_servers()
 
 // ---- hub ----
 
-const int HUB_ITEMS = 11, HUB_LEAVE = 7, HUB_RANKED = 1, HUB_VOICE = 6, HUB_TURF = 8, HUB_TSET = 9, HUB_CREW = 10;
+const int HUB_ITEMS = 12, HUB_LEAVE = 7, HUB_RANKED = 1, HUB_VOICE = 6, HUB_TURF = 8, HUB_TSET = 9, HUB_CREW = 10,
+          HUB_RTS = 11;
 // The hub's order: TURF WAR (stage 4) after MY STATS; it shows while the account service answers the map.
 // TOURNAMENT MATCH after RANKED MATCH; it shows while signed in on a relay that offers tournament sets.
 // MY CREW (build 77) after TURF WAR (after MY STATS when TURF WAR is hidden): the chat window's CREW tab
 // on the crew's page in one step (social_ui.inc); it shows while the social service offers crews, and
 // signed out (A then asks for the sign-in).
-const int HUB_ORDER[HUB_ITEMS] = { 0, 1, HUB_TSET, 2, 3, 4, HUB_TURF, HUB_CREW, 5, 6, 7 };
+// RUN THE STREETS (build 86, closed test) after RANKED MATCH, only for accounts with access (rts.c): everyone else
+// sees no trace of it.
+const int HUB_ORDER[HUB_ITEMS] = { 0, 1, HUB_RTS, HUB_TSET, 2, 3, 4, HUB_TURF, HUB_CREW, 5, 6, 7 };
+void open_rts();
 bool my_crew_shown();   // social_ui.inc
 void open_my_crew();
 bool tset_shown();      // tset_ui.inc
@@ -1975,10 +2054,10 @@ void draw_servers(ImDrawList *dl, const Frame &f, const Pad &pad)
     door_panel(dl, f);
     if (S.servers_sel == ALL_ROW)
         door_text(dl, f, &tex("ui/online_icon.png"), "ALL SERVERS", "YOU CHOOSE WHOM YOU PLAY",
-                  "The rooms of Europe, US East and US West in one list; joining one moves you there. Matches across "
+                  "The rooms of Europe, US East and Asia in one list; joining one moves you there. Matches across "
                   "the ocean have higher ping.");
     else
-        door_text(dl, f, &tex("ui/online_icon.png"), "SERVER", "EUROPE, US EAST OR US WEST",
+        door_text(dl, f, &tex("ui/online_icon.png"), "SERVER", "EUROPE, US EAST OR ASIA",
                   "The nearest one gives the lowest ping. When nobody is there, Quick Match looks on the other servers "
                   "too. Your account, stats and the leaderboard are the same on all.");
     if (checking) {
@@ -2012,11 +2091,12 @@ void draw_servers(ImDrawList *dl, const Frame &f, const Pad &pad)
 void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
 {
     static const char *const items[] = { "QUICK MATCH", "RANKED MATCH", "FIND A ROOM", "CREATE A ROOM", "MY STATS",
-                                         "PLAYERS ONLINE", "VOICE CHAT", "LEAVE", "TURF WAR", "TOURNAMENT MATCH", "MY CREW" };
+                                         "PLAYERS ONLINE", "VOICE CHAT", "LEAVE", "TURF WAR", "TOURNAMENT MATCH", "MY CREW",
+                                         "RUN THE STREETS" };
     static const char *const subs[] = { "STRAIGHT INTO A FIGHT", "ONE ON ONE FOR YOUR RATING", "OPEN ROOMS", "YOUR RULES",
                                         "RECORD AND LEADERBOARD", "WHO IS AROUND", "TALK IN ROOMS AND FIGHTS",
                                         "BACK TO THE MENU", "CREWS FIGHT FOR NEW YORK", "YOUR SET IN A TOURNAMENT",
-                                        "YOUR CREW'S PAGE" };
+                                        "YOUR CREW'S PAGE", "THE CITY IS YOURS - CLOSED TEST" };
     static const char *const descs[] = {
         "You are put into an open room of this mode, or one is opened for the next players.",
         "Classic (stock fighters) or Open (your created fighter too), best of three sets against a player of a "
@@ -2034,6 +2114,8 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         "set by the tournament's rules: the coin toss, the stage picks, Dave's rule and the winner's fighter.",
         "Your crew's page: its members and who is online, its level, record and turf, the crew chat and the "
         "ladder. Not in a crew yet: your crew invites, or found one of your own. Sign in with Discord to have one.",
+        "A whole New York block at night, up to four fighters loose on the streets. Get knocked out, you are back "
+        "on a corner in seconds; the KO target takes it, or the lead when the clock runs out. Against the CPU or online.",
     };
     std::vector<int> quick_modes = mode_cycle();     // King of the Hill last, when the relay has it
     int mode_count = (int)quick_modes.size();
@@ -2041,10 +2123,11 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
     turf_poll();
     tset_poll();
     int shown[HUB_ITEMS], count = 0, at = 0;
-    bool turf = turf_shown(), tour = tset_shown(), crew = my_crew_shown();
+    bool turf = turf_shown(), tour = tset_shown(), crew = my_crew_shown(), rts = gallery_on() ? G.rts : rts_access() != 0;
     for (int k = 0; k < HUB_ITEMS; k++) {
         int i = HUB_ORDER[k];
-        if ((i != HUB_RANKED || ranked_shown()) && (i != HUB_TURF || turf) && (i != HUB_TSET || tour) && (i != HUB_CREW || crew))
+        if ((i != HUB_RANKED || ranked_shown()) && (i != HUB_TURF || turf) && (i != HUB_TSET || tour) && (i != HUB_CREW || crew) &&
+            (i != HUB_RTS || rts))
             shown[count++] = i;
     }
     for (int k = 0; k < count; k++) if (shown[k] == S.hub_sel) at = k;
@@ -2055,6 +2138,13 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
     // entry, and stayed there for every later Quick Match)
     if (S.hub_sel == 0 && (pad.left || pad.right) && mode_count)
         S.quick_mode = std::max(0, std::min(mode_count - 1, S.quick_mode + (pad.right ? 1 : -1)));
+    // build 86: LB switches who this quick match meets (remembered per type, so it is one press next time)
+    if (S.hub_sel == 0 && pad.lb && mode_count) {
+        int type = quick_modes[S.quick_mode];
+        search_original_toggle(type);
+        say(search_original(type) ? "Original fighters only: you meet players who chose the same, in rooms without community fighters or skins."
+                                  : "All fighters: community fighters and skins too. You can still meet players who chose original only.", 5000);
+    }
 
     page_title(dl, f, "ONLINE");
     if (online_count(dl, f, true) || pad.x) open_servers();
@@ -2091,9 +2181,13 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         text(dl, f, g_hand, size, 50, size < 11 ? 50 : 54, ORANGE, problem, LEFT, 0.8f, 556);
     } else if (news > 0 && signed_in) {
         // build 82: new community packs: the rooms of players who have them take only PCs with the same packs
+        // build 86: UPDATE NOW on Y (or a click on its hint): the game closes, the launcher gets them and starts it again
         std::string news_line = upper(NETPLAY_CONTENT_NEWS_LINE);
-        text(dl, f, g_title, std::min(14.0f, fit_size(f, g_title, 14, news_line.c_str(), 556)), 50, 56, ORANGE,
-             news_line.c_str(), LEFT, 1.2f);
+        float size = std::min(14.0f, fit_size(f, g_title, 14, news_line.c_str(), 440));
+        text(dl, f, g_title, size, 50, 56, ORANGE, news_line.c_str(), LEFT, 1.2f);
+        float hx = 50 + text_width(f, g_title, size, news_line.c_str()) + 14;
+        float hw = hint(dl, f, hx, 55, "y", "UPDATE NOW");
+        if (pad.y || mouse_click(f, hx, 53, hw, 20)) online_screen::update_prompt_begin("hub");
     } else if (signed_in) {
         // build 83: the ranked season's countdown (and the Turf War's), where the line is free
         std::string l = ranked_shown() ? season_countdown() : std::string();
@@ -2118,7 +2212,7 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         }
     }
     {   // the items on one glass panel
-        float bottom = count > 10 ? 77 + (count - 1) * 29.5f + 28 : count > 9 ? 78 + (count - 1) * 33 + 31 : count > 8 ? 80 + (count - 1) * 37 + 35
+        float bottom = count > 11 ? 76 + (count - 1) * 27.2f + 26 : count > 10 ? 77 + (count - 1) * 29.5f + 28 : count > 9 ? 78 + (count - 1) * 33 + 31 : count > 8 ? 80 + (count - 1) * 37 + 35
                      : count > 7 ? 84 + (count - 1) * 41 + 39 : count > 6 ? 84 + (count - 1) * 45 + 42 : 88 + (count - 1) * 53 + 46;
         glass(dl, f, 36, 74, 290, bottom - 74 + 10);
     }
@@ -2127,15 +2221,15 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
         // eight items (ranked shown) sit closer, so the panel still ends above the hints
         // nine (ranked and turf shown): closer still, a little smaller
         // ten (tournament match too): closer still; eleven (MY CREW too, build 77): closer still
-        bool nine = count > 8, ten = count > 9, eleven = count > 10;
-        float x = 50, y = eleven ? 77 + k * 29.5f : ten ? 78 + k * 33 : nine ? 80 + k * 37 : count > 7 ? 84 + k * 41 : count > 6 ? 84 + k * 45 : 88 + k * 53, w = 262;
-        float h = eleven ? 28 : ten ? 31 : nine ? 35 : count > 7 ? 39 : count > 6 ? 42 : 46;
+        bool nine = count > 8, ten = count > 9, eleven = count > 10, twelve = count > 11;
+        float x = 50, y = twelve ? 76 + k * 27.2f : eleven ? 77 + k * 29.5f : ten ? 78 + k * 33 : nine ? 80 + k * 37 : count > 7 ? 84 + k * 41 : count > 6 ? 84 + k * 45 : 88 + k * 53, w = 262;
+        float h = twelve ? 26 : eleven ? 28 : ten ? 31 : nine ? 35 : count > 7 ? 39 : count > 6 ? 42 : 46;
         if (mouse_pick(f, x, y, w, h)) S.hub_sel = i;
         bool sel = S.hub_sel == i;
         if (sel) selector(dl, f, x, y, w, h);
-        text(dl, f, g_title, eleven ? 17 : ten ? 19 : nine ? 21 : 23, x + 16, y + (nine ? 1 : 3),
+        text(dl, f, g_title, twelve ? 16 : eleven ? 17 : ten ? 19 : nine ? 21 : 23, x + 16, y + (nine ? 1 : 3),
              sel ? CREAM : with_alpha(GREY, 0.85f), items[i], LEFT, 1.6f);
-        text(dl, f, g_hand, eleven ? 9 : ten ? 10 : nine ? 11 : 12, x + 18, y + (eleven ? 19.5f : ten ? 21 : nine ? 24 : 29), sel ? ORANGE : with_alpha(ORANGE, 0.45f), subs[i], LEFT, 1.0f);
+        text(dl, f, g_hand, twelve ? 8.5f : eleven ? 9 : ten ? 10 : nine ? 11 : 12, x + 18, y + (twelve ? 18.0f : eleven ? 19.5f : ten ? 21 : nine ? 24 : 29), sel ? ORANGE : with_alpha(ORANGE, 0.45f), subs[i], LEFT, 1.0f);
         // build 62: who searches ranked right now (every mode, each player once), at the item's right
         if (i == HUB_RANKED) {
             searching_poll();
@@ -2177,6 +2271,15 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
             text(dl, f, g_hand, 12, 463 + door_dx(), 378, ORANGE, "UP TO 8 PLAYERS, 4 FIGHT, WINNER STAYS", CENTER, 0.8f, 200);
         else if (S.quick_mode > 0 && mode_name(type))
             text(dl, f, g_hand, 12, 463 + door_dx(), 378, ORANGE, upper(mode_name(type)).c_str(), CENTER, 0.8f, 200);
+        // build 86: the fighters this search meets, between the text and the mode; LB (or a click) switches
+        {
+            bool orig = search_original(type);
+            const char *w = original_words(orig);
+            float tw = text_width(f, g_title, 11, w), bx = 463 + dx - tw / 2 - 10, by = 352;
+            if (mouse_click(f, bx, by, tw + 20, 18)) search_original_toggle(type);
+            rect(dl, f, bx, by, tw + 20, 18, orig ? IM_COL32(40, 70, 120, 220) : IM_COL32(120, 12, 26, 200), 5);
+            text(dl, f, g_title, 11, 463 + dx, by + 2, WHITE, w, CENTER, 0.8f);
+        }
     }
 
     if (pad.a) {
@@ -2211,7 +2314,7 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
                 } else {
                     netplay_lobby_quick(type, qmax);
                     S.quick_wanted = !NETPLAY_IS_HILL(type);
-                    say("Looking for a room...");
+                    say(search_original(type) ? "Looking for a room (original fighters only)..." : "Looking for a room...");
                 }
             }
             break;
@@ -2243,8 +2346,250 @@ void draw_hub(ImDrawList *dl, const Frame &f, const Pad &pad)
                                                        : pad_text("Sign in with Discord first: press {y}."));
             else open_my_crew();
             break;
+        case HUB_RTS: open_rts(); break;
         case HUB_LEAVE: break;      // handled by the caller (closes)
         }
+    }
+}
+
+// ---- RUN THE STREETS (build 86, closed test) ----
+// The open-world mode's own page: VS CPU (offline, you and 1-3 CPU fighters on the Run the Streets map; the fighter
+// from the hub's fighter grid), QUICK MATCH and CREATE A ROOM (online, a Run the Streets room of up to four on this
+// relay), FIND A ROOM (the room list, which shows Run the Streets rooms to testers only). Shown only while rts_access()
+// says yes (rts.c); the relay checks the access again on its side.
+bool g_rts_close = false;
+
+void open_rts()
+{
+    S.page = RTS;
+    S.rts_sel = 0;
+    S.rts_setup = false;
+    if (S.rts_cpus < 2 || S.rts_cpus > 3) S.rts_cpus = 3;
+}
+
+// Build 87: a Run the Streets round's rules (openworld.h's rules byte: TIME LIMIT 5 / 10 / 15 minutes or none, KO
+// TARGET 5 / 10 / 20; 0 the defaults, 10 minutes and first to 10). VS CPU keeps its own in the settings ([openworld]
+// rts_time_limit / rts_ko_target); a room's are the host's (the room settings' rounds byte, which the relay checks
+// and sends in START to every PC of the fight).
+std::string rts_time_text(int rules)
+{
+    int t, k;
+    ow_rules_rts_decode(rules, &t, &k);
+    int secs = ow_rules_rts_seconds(t);
+    return secs > 0 ? std::to_string(secs / 60) + " minutes" : "None: the KO target ends it";
+}
+std::string rts_kos_text(int rules)
+{
+    int t, k;
+    ow_rules_rts_decode(rules, &t, &k);
+    return "First to " + std::to_string(ow_rules_rts_kos(k)) + " knockouts";
+}
+// step the time limit (row 0) or the KO target (row 1) of a rules byte; the time limit wraps (none after 15), the
+// KO target stops at its ends
+int rts_rules_step(int rules, int which, int step)
+{
+    int t, k;
+    ow_rules_rts_decode(rules, &t, &k);
+    if (which == 0) t = (t + step + OW_RTS_TIMES) % OW_RTS_TIMES;
+    else k = std::max(0, std::min(OW_RTS_KOS - 1, k + step));
+    return ow_rules_rts_encode(t, k);
+}
+std::string rts_rules_tag(int rules)
+{
+    char b[48];
+    ow_rules_rts_text(rules, b, (int)sizeof b);
+    return b;
+}
+
+// VS CPU's set-up: the CPU fighters, TIME LIMIT, KO TARGET, then CHOOSE FIGHTER (A) into the hub's fighter grid. Every
+// row with the stick or the D-pad left/right; B back to the page.
+void draw_rts_setup(ImDrawList *dl, const Frame &f, const Pad &pad, bool have_map)
+{
+    static const char *const labels[] = { "CPU FIGHTERS", "TIME LIMIT", "KO TARGET", "" };
+    const int rows = 4;
+    int rules = gallery_on() ? G.rts_rules : rts_offline_rules();
+    page_title(dl, f, "VS CPU");
+    text(dl, f, g_hand, 15, 54, 66, ORANGE, "RUN THE STREETS, OFFLINE", LEFT, 0.8f);
+    if (pad.up) S.rts_setup_sel = (S.rts_setup_sel + rows - 1) % rows;
+    if (pad.down) S.rts_setup_sel = (S.rts_setup_sel + 1) % rows;
+    int step = pad.right ? 1 : pad.left ? -1 : 0;
+    if (step) {
+        switch (S.rts_setup_sel) {
+        case 0: S.rts_cpus = std::max(2, std::min(3, S.rts_cpus + step)); break;
+        case 1: case 2: {
+            int nr = rts_rules_step(rules, S.rts_setup_sel - 1, step);
+            if (gallery_on()) G.rts_rules = nr;
+            else rts_offline_set_rules(nr);
+            rules = nr;
+            break;
+        }
+        }
+    }
+    for (int i = 0; i < rows; i++) {
+        float x = 50, y = 96 + i * 54.0f, w = 270, h = 44;
+        if (mouse_pick(f, x, y, w, h)) S.rts_setup_sel = i;
+        bool sel = S.rts_setup_sel == i;
+        glass(dl, f, x, y, w, h, 7, sel ? IM_COL32(44, 32, 22, 255) : IM_COL32(10, 10, 13, 255), sel ? 0.78f : 0.6f);
+        if (sel) selector(dl, f, x, y, w, h);
+        if (i == 3) {
+            text(dl, f, g_title, 20, x + w / 2, y + h / 2 - 11, sel ? CREAM : GREY, "CHOOSE FIGHTER", CENTER);
+            if (mouse_click(f, x, y, w, h)) const_cast<Pad &>(pad).a = true;
+            continue;
+        }
+        text(dl, f, g_title, 12, x + 12, y + 4, GREY, labels[i]);
+        std::string value = i == 0 ? std::to_string(S.rts_cpus) + " CPU fighters" : i == 1 ? rts_time_text(rules) : rts_kos_text(rules);
+        text(dl, f, g_title, 17, x + 12, y + 19, sel ? WHITE : GREY, value.c_str());
+        if (sel) {
+            text(dl, f, g_title, 17, x + w - 26, y + h / 2 - 10, ORANGE, "<", CENTER);
+            text(dl, f, g_title, 17, x + w - 10, y + h / 2 - 10, ORANGE, ">", CENTER);
+        }
+    }
+    door_panel(dl, f);
+    {
+        int t, k;
+        ow_rules_rts_decode(rules, &t, &k);
+        int secs = ow_rules_rts_seconds(t), kos = ow_rules_rts_kos(k);
+        std::string d = "You and " + std::to_string(S.rts_cpus) + " CPU fighters on the block. First to " +
+                        std::to_string(kos) + " knockouts wins" +
+                        (secs > 0 ? ", or the most when the " + std::to_string(secs / 60) +
+                                        " minutes are up. The clock is on the score plate."
+                                  : ". No time limit: the KO target ends it.");
+        door_text(dl, f, &tex("ui/online_icon.png"), "VS CPU", rts_rules_tag(rules).c_str(), d.c_str());
+    }
+    float hx = 54;
+    hx += hint(dl, f, hx, 392, "a", S.rts_setup_sel == 3 ? "CHOOSE FIGHTER" : "NEXT");
+    hint(dl, f, hx, 392, "b", "BACK");
+    if (pad.b) { S.rts_setup = false; return; }
+    if (!pad.a) return;
+    if (S.rts_setup_sel < 3) { S.rts_setup_sel++; return; }
+    if (!have_map) { say("Run the Streets has no map on this PC yet: start the game from the launcher to get it."); return; }
+    S.rts_pick = true;
+    S.ranked_pick = false;
+    S.page = FIGHTERS;
+}
+
+void rts_fighter_chosen(int fighter)
+{
+    if (rts_offline_start(fighter, S.pick_skin, S.rts_cpus, nullptr)) {
+        say("To the streets...");
+        g_rts_close = true;
+        S.page = HUB;
+    } else {
+        say("Run the Streets has no map on this PC yet: start the game from the launcher to get it.");
+        S.page = RTS;
+    }
+}
+
+// A new Run the Streets room: up to four (free places filled by CPU fighters), listed, the defaults' rules (10
+// minutes, first to 10), its venue the map (the relay plays its own Run the Streets map list anyway).
+void rts_room_settings(NetRoomSettings &s, int map_fe_id)
+{
+    default_settings(s);
+    s.mode = NETPLAY_MODE_RTS;
+    s.max = NETPLAY_RTS_SLOTS;
+    s.is_public = 1;
+    s.rounds = 0;
+    s.pool_count = 1;
+    s.pool[0] = (unsigned char)(map_fe_id > 0 ? map_fe_id : 28);
+}
+
+void draw_rts(ImDrawList *dl, const Frame &f, const Pad &pad)
+{
+    static const char *const items[] = { "VS CPU", "QUICK MATCH", "CREATE A ROOM", "FIND A ROOM" };
+    static const char *const subs[] = { "YOU AGAINST THE CPU, OFFLINE", "INTO A STREET FIGHT ONLINE",
+                                        "UP TO FOUR, YOUR ROOM", "OPEN STREET FIGHTS" };
+    static const char *const descs[] = {
+        "You and 2 or 3 CPU fighters loose on the block. Knocked out? Back on a street corner in three seconds. "
+        "First to the KO target, or the most when the time is up.",
+        "You are put into an open Run the Streets room on this server, or one is opened for the next players.",
+        "A Run the Streets room of your own for up to four. Others join from the list or by its code; free places "
+        "are filled with CPU fighters.",
+        "Every listed room; Run the Streets rooms show their mode.",
+    };
+    if (!(gallery_on() ? G.rts : rts_access())) {      // the access went (signed out, or taken away): nothing left
+        S.page = HUB;
+        return;
+    }
+    RtsMap map;
+    bool have_map = rts_map(&map) != 0;
+    if (S.rts_setup) { draw_rts_setup(dl, f, pad, have_map); return; }
+    page_title(dl, f, "RUN THE STREETS");
+    if (pad.up) S.rts_sel = (S.rts_sel + 3) % 4;
+    if (pad.down) S.rts_sel = (S.rts_sel + 1) % 4;
+    if (S.rts_sel == 0 && (pad.left || pad.right))
+        S.rts_cpus = std::max(2, std::min(3, S.rts_cpus + (pad.right ? 1 : -1)));
+    {
+        std::string where = have_map ? "THE MAP: " + upper(map.name[0] ? map.name : map.code) : "NO MAP YET: START FROM THE LAUNCHER";
+        text(dl, f, g_title, 14, 50, 56, have_map ? CREAM : ORANGE, where.c_str(), LEFT, 1.2f, 556);
+    }
+    glass(dl, f, 36, 74, 290, 4 * 60 + 14);
+    for (int i = 0; i < 4; i++) {
+        float x = 50, y = 84 + i * 60.0f, w = 262, h = 52;
+        if (mouse_pick(f, x, y, w, h)) S.rts_sel = i;
+        bool sel = S.rts_sel == i;
+        if (sel) selector(dl, f, x, y, w, h);
+        text(dl, f, g_title, 24, x + 16, y + 3, sel ? CREAM : with_alpha(GREY, 0.85f), items[i], LEFT, 1.6f);
+        std::string sub = subs[i];
+        if (i == 0) sub = "YOU AGAINST " + std::to_string(S.rts_cpus) + " CPU, OFFLINE";
+        text(dl, f, g_hand, 12, x + 18, y + 31, sel ? ORANGE : with_alpha(ORANGE, 0.45f), sub.c_str(), LEFT, 1.0f);
+        if (i == 0) {       // the CPU count: < 1..3 >
+            char n[8];
+            snprintf(n, sizeof(n), "%d", S.rts_cpus);
+            text(dl, f, g_title, 18, x + w - 52, y + 6, S.rts_cpus > 2 ? ORANGE : with_alpha(GREY, 0.35f), "<", CENTER, 1.2f);
+            text(dl, f, g_title, 22, x + w - 34, y + 4, CREAM, n, CENTER, 1.2f);
+            text(dl, f, g_title, 18, x + w - 16, y + 6, S.rts_cpus < 3 ? ORANGE : with_alpha(GREY, 0.35f), ">", CENTER, 1.2f);
+        }
+        if (mouse_click(f, x, y, w, h)) const_cast<Pad &>(pad).a = true;
+    }
+    door_panel(dl, f);
+    {
+        std::string d = descs[S.rts_sel];
+        if (S.rts_sel == 0) {       // build 87: the rules VS CPU plays by now (its set-up changes them)
+            int t, k, rules = gallery_on() ? G.rts_rules : rts_offline_rules();
+            ow_rules_rts_decode(rules, &t, &k);
+            int secs = ow_rules_rts_seconds(t);
+            d = "You and 2 or 3 CPU fighters loose on the block. Knocked out? Back on a street corner in three seconds. "
+                "First to " + std::to_string(ow_rules_rts_kos(k)) + " knockouts" +
+                (secs > 0 ? ", or the most when " + std::to_string(secs / 60) + " minutes are up." : ", no time limit.") +
+                " A sets the time limit and the KO target, then your fighter.";
+        } else if (S.rts_sel == 2) {
+            d += " You set the time limit and the KO target.";
+        }
+        door_text(dl, f, &tex("ui/online_icon.png"), items[S.rts_sel], subs[S.rts_sel], d.c_str());
+    }
+    float hx = 54;
+    hx += hint(dl, f, hx, 392, "a", "SELECT");
+    hint(dl, f, hx, 392, "b", "BACK");
+    if (pad.b) { S.page = HUB; return; }
+    if (!pad.a) return;
+    if (!have_map) { say("Run the Streets has no map on this PC yet: start the game from the launcher to get it."); return; }
+    bool relay_ok = gallery_on() || netplay_relay_rts();
+    switch (S.rts_sel) {
+    case 0:     // build 87: the set-up first (CPU fighters, TIME LIMIT, KO TARGET), then the fighter
+        S.rts_setup = true;
+        S.rts_setup_sel = 0;
+        break;
+    case 1:
+        if (!relay_ok) { say("This server does not run Run the Streets yet: pick another one with X in the online menu."); break; }
+        S.last_quick = NETPLAY_MODE_RTS;
+        S.last_quick_max = NETPLAY_RTS_SLOTS;
+        S.auto_moves = 0;
+        S.quick_since = 0;
+        S.quick_scope = 0;
+        netplay_lobby_quick(NETPLAY_MODE_RTS, NETPLAY_RTS_SLOTS);
+        S.quick_wanted = true;
+        say("Looking for a street fight...");
+        S.page = HUB;
+        break;
+    case 2: {   // build 87: through CREATE A ROOM's settings, with the time limit and the KO target
+        if (!relay_ok) { say("This server does not run Run the Streets yet: pick another one with X in the online menu."); break; }
+        rts_room_settings(S.settings, map.fe_id);
+        S.settings_edit = false;
+        S.settings_sel = 1;     // TIME LIMIT
+        S.page = SETTINGS;
+        break;
+    }
+    case 3: S.page = ROOMS; netplay_lobby_list(0xFF); S.last_list = GetTickCount64(); break;
     }
 }
 
@@ -2800,21 +3145,26 @@ void venue_showcase(ImDrawList *dl, const Frame &f, const NetRoomSettings &s, fl
 void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom &room)
 {
     // the rows; a King of the Hill room has one more, how each fight's venue is chosen
-    enum Row { R_MODE, R_VENUE_CHOICE, R_PLAYERS, R_POOL, R_LISTED, R_OPEN, R_CPU, R_RULES, R_PING, R_CONTENT };
+    enum Row { R_MODE, R_VENUE_CHOICE, R_PLAYERS, R_POOL, R_LISTED, R_OPEN, R_CPU, R_RULES, R_PING, R_CONTENT, R_RTS_TIME,
+               R_RTS_KOS };
     static const char *const labels[] = { "MODE", "VENUE OF EACH FIGHT", "PLAYERS", "VENUES", "LISTED", "", "CPU LEVEL",
-                                          "FIGHTER RULES", "MAX PING", "COMMUNITY CONTENT" };
+                                          "FIGHTER RULES", "MAX PING", "COMMUNITY CONTENT", "TIME LIMIT", "KO TARGET" };
     NetRoomSettings &s = S.settings;
-    bool was_koth = NETPLAY_IS_KOTH(s.mode), was_rot = NETPLAY_IS_FFAROT(s.mode);
-    // the host cannot turn a room into the other kind (the relay refuses it)
-    std::vector<int> cycle = S.settings_edit ? mode_cycle(was_koth, !was_koth, was_rot) : mode_cycle();
-    std::vector<int> rows_of = { R_MODE, R_PLAYERS, R_POOL, R_LISTED, R_OPEN };
+    bool was_koth = NETPLAY_IS_KOTH(s.mode), was_rot = NETPLAY_IS_FFAROT(s.mode), rts = NETPLAY_IS_RTS(s.mode);
+    // the host cannot turn a room into the other kind (the relay refuses it); a Run the Streets room stays one
+    std::vector<int> cycle = rts ? std::vector<int>{ NETPLAY_MODE_RTS }
+                           : S.settings_edit ? mode_cycle(was_koth, !was_koth, was_rot) : mode_cycle();
+    // build 87: a Run the Streets room has the time limit and the KO target after its mode, and no venue row (the
+    // relay plays its map) and no community content switch (the map is official content)
+    std::vector<int> rows_of = rts ? std::vector<int>{ R_MODE, R_RTS_TIME, R_RTS_KOS, R_PLAYERS, R_LISTED, R_OPEN }
+                                   : std::vector<int>{ R_MODE, R_PLAYERS, R_POOL, R_LISTED, R_OPEN };
     if (was_koth) rows_of.insert(rows_of.begin() + 1, R_VENUE_CHOICE);
     // build 67: how strong the CPU fighters are that fill a 3-Way's or Free for All's free places
-    if (cpu_level_offered(s.mode)) rows_of.insert(rows_of.begin() + 2, R_CPU);
+    if (cpu_level_offered(s.mode)) rows_of.insert(rows_of.begin() + (rts ? 4 : 2), R_CPU);
     // build 68: which fighters may be picked, and the highest ping a joining player may have (before LISTED)
     if (rules_offered()) rows_of.insert(rows_of.end() - 2, { R_RULES, R_PING });
     // build 82: community content (new fighters, new venues) on or off for this room, when this PC has some
-    if (content_switch_offered()) rows_of.insert(rows_of.end() - 2, R_CONTENT);
+    if (content_switch_offered() && !rts) rows_of.insert(rows_of.end() - 2, R_CONTENT);
     const int rows = (int)rows_of.size();
     if (S.settings_sel >= rows) S.settings_sel = rows - 1;
     if (pad.up) S.settings_sel = (S.settings_sel + rows - 1) % rows;
@@ -2826,6 +3176,7 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
     // Team: four, no CPU partners (the relay starts a Team room with four only)
     auto least_of = [](int mode) { return NETPLAY_IS_HILL(mode) ? 3 : is_team(mode) ? 4 : 2; };
     auto most_of = [](int mode) {
+        if (NETPLAY_IS_RTS(mode)) return NETPLAY_RTS_SLOTS;
         if (NETPLAY_IS_KOTH(mode)) return NETPLAY_ROOM_SLOTS;
         if (NETPLAY_IS_FFAROT(mode)) return NETPLAY_FFAROT_SLOTS;
         const OnlineMode *om = online_mode(mode);
@@ -2872,8 +3223,11 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
             s.max_ping = order[(at + step + 4) % 4];
             break;
         }
+        case R_RTS_TIME: s.rounds = rts_rules_step(s.rounds, 0, step); break;   // 5, 10, 15 minutes, none
+        case R_RTS_KOS: s.rounds = rts_rules_step(s.rounds, 1, step); break;    // first to 5, 10, 20
         }
     }
+    if (rts && !ow_rules_rts_valid(s.rounds)) s.rounds = 0;
     if (!NETPLAY_CPU_FILL(s.mode)) s.cpu_level = NETPLAY_CPU_HARD;     // no CPU fighters: the default
     m = online_mode(s.mode);
     if (s.max > most_of(s.mode)) s.max = most_of(s.mode);
@@ -2909,7 +3263,9 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
         case R_PLAYERS:
             if (koth || rot) { snprintf(buf, sizeof(buf), "Up to %d in the line", s.max); value = buf; break; }
             snprintf(buf, sizeof(buf), is_team(s.mode) ? "%d players, 2 vs 2" : "%d players", s.max); value = buf;
-            if (m && s.max < m->fighters) { snprintf(buf, sizeof(buf), " + %d CPU", m->fighters - s.max); value += buf; } break;
+            if (m && s.max < m->fighters) { snprintf(buf, sizeof(buf), " + %d CPU", m->fighters - s.max); value += buf; }
+            if (rts && s.max < NETPLAY_RTS_SLOTS) { snprintf(buf, sizeof(buf), " + %d CPU", NETPLAY_RTS_SLOTS - s.max); value += buf; }
+            break;
         case R_POOL:
             if (int v = fixed_venue(s.mode)) { value = online_venue_name(v); break; }
             { int p = preset_of(s); value = p >= 0 ? presets()[p].name : "Custom"; snprintf(buf, sizeof(buf), " (%d)", s.pool_count); value += buf; } break;
@@ -2918,16 +3274,30 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
         case R_RULES: value = rules_text(s.fighter_rules); break;
         case R_PING: value = s.max_ping > 0 ? "Up to " + max_ping_text(s.max_ping) : "Off: anyone joins"; break;
         case R_CONTENT: value = content_text(s.fighter_rules); break;
+        case R_RTS_TIME: value = rts_time_text(s.rounds); break;
+        case R_RTS_KOS: value = rts_kos_text(s.rounds); break;
         }
         text(dl, f, g_title, row_h < 34 ? 15 : 17, x + 12, y + (row_h < 34 ? 14 : row_h < 40 ? 16 : 19), sel ? WHITE : GREY, value.c_str());
         // a fixed row (a special match's venue and players) has nothing to step through
-        bool fixed = (fixed_venue(s.mode) && (row == R_POOL || row == R_PLAYERS)) || (is_team(s.mode) && row == R_PLAYERS);
+        bool fixed = (fixed_venue(s.mode) && (row == R_POOL || row == R_PLAYERS)) || (is_team(s.mode) && row == R_PLAYERS) ||
+                     (rts && row == R_MODE);
         if (sel && !fixed) { text(dl, f, g_title, 17, x + w - 26, y + h / 2 - 10, ORANGE, "<", CENTER); text(dl, f, g_title, 17, x + w - 10, y + h / 2 - 10, ORANGE, ">", CENTER); }
     }
     // the door: the mode's logo (King of the Hill: its rules), then the venues filling the panel
     door_panel(dl, f);
     float venues_y, dx = door_dx();
-    if (koth) {
+    if (rts) {     // build 87: Run the Streets: its rules as chosen, no venue vote (the relay plays its map)
+        int t, k;
+        ow_rules_rts_decode(s.rounds, &t, &k);
+        int secs = ow_rules_rts_seconds(t);
+        std::string d = "UP TO FOUR LOOSE ON THE BLOCK, FREE PLACES GO TO CPU FIGHTERS. KNOCKED OUT? BACK ON A STREET CORNER "
+                        "IN THREE SECONDS. FIRST TO " + std::to_string(ow_rules_rts_kos(k)) + " KNOCKOUTS WINS" +
+                        (secs > 0 ? ", OR THE MOST WHEN THE " + std::to_string(secs / 60) + " MINUTES ARE UP." : ". NO TIME LIMIT.");
+        text(dl, f, g_title, 24, 463 + dx, 92, CREAM, "RUN THE STREETS", CENTER, 1.6f);
+        text(dl, f, g_hand, 13, 463 + dx, 120, ORANGE, rts_rules_tag(s.rounds).c_str(), CENTER, 1.0f);
+        text(dl, f, g_body, 12, 362 + dx, 138, WHITE, d.c_str(), LEFT, 1.0f, 202);
+        venues_y = 214;
+    } else if (koth) {
         text(dl, f, g_title, 24, 463 + dx, 92, CREAM, "KING OF THE HILL", CENTER, 1.6f);
         text(dl, f, g_hand, 13, 463 + dx, 120, ORANGE, "WINNER STAYS ON", CENTER, 1.0f);
         text(dl, f, g_body, 12, 362 + dx, 138, WHITE,
@@ -2949,12 +3319,13 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
             venues_y = 178;
         }
     }
-    venue_showcase(dl, f, s, 356 + dx, venues_y, 214, (g_game_door ? 438 : DOOR_Y + DOOR_H - 6) - venues_y);
+    if (!rts)       // a Run the Streets room plays the relay's map: no venues to show
+        venue_showcase(dl, f, s, 356 + dx, venues_y, 214, (g_game_door ? 438 : DOOR_Y + DOOR_H - 6) - venues_y);
     if (pad.a && rows_of[S.settings_sel] == R_OPEN) {
         if (S.settings_edit) { netplay_lobby_settings(&s); S.page = HUB; say("Settings saved; everyone readies again."); }
         else { netplay_lobby_create(&s); say("Opening the room..."); S.page = HUB; }
     }
-    if (pad.b) S.page = HUB;
+    if (pad.b) S.page = rts && !S.settings_edit ? RTS : HUB;      // a new Run the Streets room: back to its page
     (void)room;
 }
 
@@ -2970,14 +3341,34 @@ void draw_settings(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom
 const int FIGHTER_RANDOM = -2;
 bool crew_room(const NetRoom &r, NetCrew *out);    // crew_ui.inc: a crew battle's room
 std::vector<int> g_grid_cp;
+bool tset_room(const NetRoom &r, NetTSet *out);       // tset_ui.inc
+
+// Build 86: whether CHOOSE FIGHTER offers community fighters beyond the places (fighter_banks.h) here: this PC has
+// some, the relay takes fighter numbers (NETPLAY_CAP_UNLIMITED), and the room (or the search) is not ranked, a
+// tournament set, a crew battle, STANDARD ONLY or without created fighters. The relay checks the same and more (every
+// member of the room must have a game that knows them); a pick it cannot keep plays its template.
+bool community_numbers_here(const NetRoom &r)
+{
+    if (fighter_banks_count() <= 0 || (!gallery_on() && !netplay_lobby_unlimited())) return false;
+    if (!r.in_room) return !S.ranked_pick;
+    NetRankInfo ri;
+    NetTSet t;
+    NetCrew cb;
+    if (ranked_room(r, &ri) || tset_room(r, &t) || crew_room(r, &cb)) return false;
+    return (r.settings.fighter_rules & (NETPLAY_RULES_NO_CREATED | NETPLAY_RULES_STANDARD)) == 0;
+}
 const std::vector<OnlineFighter> &grid_fighters()
 {
     static std::vector<OnlineFighter> list;
     static std::vector<std::string> styles;
     list = roster();
-    g_grid_cp.assign(list.size(), -1);
     NetRoom r;
     lobby_room(&r);
+    // build 86: a room for original fighters only (STANDARD ONLY) shows no community fighters at all
+    if (r.in_room && standard_only(r.settings.fighter_rules))
+        list.erase(std::remove_if(list.begin(), list.end(), [](const OnlineFighter &o) { return ONLINE_NEW_FIGHTER(o.id) != 0; }),
+                   list.end());
+    g_grid_cp.assign(list.size(), -1);
     // build 76: in King of the Hill and FFA rotation rooms too where the relay plays them (not crew battles)
     bool hill_cp = false;
     if (r.in_room && NETPLAY_IS_HILL(r.settings.mode)) {
@@ -2998,6 +3389,29 @@ const std::vector<OnlineFighter> &grid_fighters()
             cp.style = styles[i].c_str();
             list.insert(list.begin(), cp);
             g_grid_cp.insert(g_grid_cp.begin(), (int)i);
+        }
+    }
+    if (community_numbers_here(r)) {
+        // build 86: community fighters beyond the places: a shelf (played this session first, then by number) and
+        // MORE, the paged list of every one (the community window)
+        int shelf[32], m = new_fighters_shelf(shelf, 30);
+        for (int k = 0; k < m; k++) {
+            const FighterBanksEntry *e = fighter_banks_find(shelf[k]);
+            if (!e) continue;
+            OnlineFighter o{};
+            o.id = e->id;
+            snprintf(o.name, sizeof(o.name), "%s", e->name);
+            o.style = "COMMUNITY FIGHTER";
+            list.push_back(o);
+            g_grid_cp.push_back(-1);
+        }
+        if (fighter_banks_count() > m) {
+            OnlineFighter more{};
+            more.id = FB_MORE_ID;
+            snprintf(more.name, sizeof(more.name), "More");
+            more.style = "EVERY COMMUNITY FIGHTER";
+            list.push_back(more);
+            g_grid_cp.push_back(-1);
         }
     }
     if (list.size() > 1) {
@@ -3032,12 +3446,13 @@ int grid_pos(const std::vector<OnlineFighter> &list, int fighter)
 }
 
 #include "skins_ui.inc"
+#include "community_ui.inc"
 
 void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chosen, int *fighter)
 {
     // build 85: while the skin window is open the grid takes no input (the window does, below)
     Pad idle = {};
-    const Pad &pad = S.skin_open ? idle : pad_in;
+    const Pad &pad = S.skin_open || S.unl_open ? idle : pad_in;
     const auto &list = grid_fighters();
     int n = (int)list.size();
     const int cols = 7, rows = 4;
@@ -3102,7 +3517,7 @@ void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chos
     auto blocked = [&](int i) { return list[i].id != FIGHTER_RANDOM && fighter_blocked(rules_room, list[i].id); };
     // the chosen fighter, large, with name and style
     glass(dl, f, 36, 74, 180, 308);
-    if (cur.id == FIGHTER_RANDOM) random_card(dl, f, 46, 84, 160, 240, true, 110);
+    if (cur.id == FIGHTER_RANDOM || cur.id == FB_MORE_ID) random_card(dl, f, 46, 84, 160, 240, true, 110);
     else if (!portrait(dl, f, cur.id, 46, 84, 160, 240))
         text(dl, f, g_title, 26, 126, 180, with_alpha(CREAM, 0.6f), cur.name, CENTER, 1.4f, 150);
     S.fighters_cp = cur_cp;
@@ -3144,6 +3559,10 @@ void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chos
             if (list[i].id == FIGHTER_RANDOM) {
                 random_card(dl, f, x, y, cw, ch, sel, 34);
                 text(dl, f, g_title, 9, x + cw / 2, y + ch - 14, sel ? WHITE : GREY, "RANDOM", CENTER, 0.6f);
+            } else if (list[i].id == FB_MORE_ID) {     // build 86: the community window
+                rect(dl, f, x + 1, y + 1, cw - 2, ch - 2, sel ? IM_COL32(56, 14, 20, 255) : IM_COL32(24, 10, 12, 255), 3);
+                text(dl, f, g_title, 20, x + cw / 2, y + ch / 2 - 16, sel ? ORANGE : with_alpha(ORANGE, 0.6f), "+", CENTER, 1.2f);
+                text(dl, f, g_title, 9, x + cw / 2, y + ch - 14, sel ? WHITE : GREY, "MORE", CENTER, 0.6f);
             } else if (!portrait(dl, f, list[i].id, x + 1, y + 1, cw - 2, ch - 2, sel ? IM_COL32_WHITE : IM_COL32(150, 150, 150, 255)))
                 text(dl, f, g_body, 9, x + 3, y + 30, GREY, list[i].name, LEFT, 0, cw - 4);
             if (list[i].id == NETPLAY_CREATED_FIGHTER) {     // the fighter's name on an orange band
@@ -3207,13 +3626,25 @@ void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chos
         S.random_pick = cur.id == FIGHTER_RANDOM;
         if (S.random_pick) {    // RANDOM is the last card: one of the others the room's rules allow
             std::vector<int> allowed;
-            for (int i = 0; i + 1 < n; i++) if (!blocked(i)) allowed.push_back(i);
+            for (int i = 0; i + 1 < n; i++) if (!blocked(i) && list[i].id < FB_FIRST_LOGICAL) allowed.push_back(i);
             pick = allowed.empty() ? online_random_below(n - 1) : allowed[online_random_below((int)allowed.size())];
         }
         int pick_cp = pick < (int)g_grid_cp.size() ? g_grid_cp[pick] : -1;
         if (pick_cp >= 0) cp_choose(pick_cp);   // which created fighter: remembered, and sent to the relay
         S.pick_skin = 0;
-        if (!S.random_pick && pick_cp < 0 && list[pick].id < 98 && fighter_skins_count(list[pick].id) > 0) {
+        // build 86: no skins in a room for original fighters only, nor in a ranked search for them
+        bool no_skins = (rules_room.in_room && standard_only(rules_room.settings.fighter_rules)) ||
+                        (S.ranked_pick && search_original(NETPLAY_ORIGINAL_RANKED));
+        if (!S.random_pick && list[pick].id == FB_MORE_ID) {
+            // build 86: MORE: the community window, on the fighter last picked from it (else the first)
+            S.unl_open = true;
+            S.unl_sel = 0;
+            int saved = recomp_settings_get("online", "fighter", -1);
+            for (int i = 0; i < fighter_banks_count(); i++) if (fighter_banks_at(i)->id == saved) S.unl_sel = i;
+            S.unl_opened = GetTickCount64();
+            { Pad none = {}; community_test_keys(none, true); }
+            fprintf(stderr, "[BANKS] hub: MORE: the community window, %d fighters, on %d\n", fighter_banks_count(), S.unl_sel);
+        } else if (!S.random_pick && pick_cp < 0 && !no_skins && list[pick].id < 98 && fighter_skins_count(list[pick].id) > 0) {
             // build 85: a fighter with skins: the skin window first, on the look played last with it
             S.skin_open = true;
             S.skin_fe = list[pick].id;
@@ -3242,9 +3673,22 @@ void draw_fighters(ImDrawList *dl, const Frame &f, const Pad &pad_in, bool *chos
         }
         if (r) S.skin_open = false;
     }
+    if (S.unl_open) {
+        int r = community_window(dl, f, GetTickCount64() - S.unl_opened > 250 ? pad_in : idle, &S.unl_sel);
+        const FighterBanksEntry *e = r == 1 ? fighter_banks_at(S.unl_sel) : nullptr;
+        if (e) {
+            *chosen = true;
+            *fighter = e->id;
+            new_fighters_shelf_played(e->id);   // on the shelf from now on
+            fprintf(stderr, "[BANKS] hub: community fighter %d \"%s\" picked\n", e->id, e->name);
+        }
+        if (r) S.unl_open = false;
+        if (r) const_cast<Pad &>(pad_in).b = false;     // B closed the window, not the page
+    }
     // BACK from a ranked search's pick goes back to the mode chooser, not to the online menu (a player
     // who wanted another fighter for ranked landed on the hub, 2026-11-03)
-    if (pad.b) S.page = S.ranked_pick ? RANKED_MODES : HUB;
+    if (pad.b) S.page = S.ranked_pick ? RANKED_MODES : S.rts_pick ? RTS : HUB;
+    if (pad.b) S.rts_pick = false;
     if (pad.a || pad.b) { S.fsearch_on = false; S.fsearch.clear(); }
 }
 
@@ -3976,6 +4420,12 @@ void draw_room(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom &r)
             text(dl, f, g_title, 10, sx, 73, ORANGE, cl.c_str(), RIGHT, 0.6f);
             sx -= text_width(f, g_title, 10, cl.c_str()) + 12;
         }
+        // build 87: a Run the Streets room's time limit and KO target, always (the round's end must never surprise)
+        if (NETPLAY_IS_RTS(r.settings.mode)) {
+            std::string rt = rts_rules_tag(r.settings.rounds);
+            text(dl, f, g_title, 10, sx, 73, ORANGE, rt.c_str(), RIGHT, 0.6f);
+            sx -= text_width(f, g_title, 10, rt.c_str()) + 12;
+        }
         // build 68: the room's rules, when not the defaults
         if (r.settings.fighter_rules != NETPLAY_RULES_ALL) {
             std::string rl = upper(rules_text(r.settings.fighter_rules));
@@ -4237,7 +4687,7 @@ void draw_room(ImDrawList *dl, const Frame &f, const Pad &pad, const NetRoom &r)
                 return;
             }
         }
-        // the notice when the search widens ("Looking on US West too...", "Looking on every server...")
+        // the notice when the search widens ("Looking on Asia too...", "Looking on every server...")
         if (!gallery_on() && S.quick_scope && (scope & ~S.quick_scope)) {
             std::string all = scope_words(sv, scope), added = scope_words(sv, scope & ~S.quick_scope);
             say(all == "every server" ? std::string("Looking on every server...") : "Looking on " + added + " too...", 5000);
@@ -4782,6 +5232,7 @@ NetRoom sample_room(int mode, int max, int count)
 #include "ranked_ui.inc"
 #include "ranked_board.inc"
 #include "social_ui.inc"
+#include "rts_social_ui.inc"
 #include "crew_ui.inc"
 #include "locker_ui.inc"
 #include "turf_ui.inc"
@@ -4804,6 +5255,10 @@ void gallery_step()
                                          "fighters-random", "vote-random",
                                          // build 85: the skin window over CHOOSE FIGHTER (a fighter with skins, else none)
                                          "fighters-skins",
+                                         // build 86: community fighters beyond the places (run with an override that has
+                                         // some, e.g. scripts/unlimited-synth.py): the grid's shelf and MORE, the community
+                                         // window over CHOOSE FIGHTER, a room whose players play two of them
+                                         "fighters-community", "fighters-more", "room-community",
                                          "ranked", "voice", "music", "music-own", "music-empty", "stats", "stats-1v1", "players", "fighters",
                                          // build 47: every server's players (All servers)
                                          "players-all",
@@ -4821,6 +5276,11 @@ void gallery_step()
                                          // RECOMP_TEST_CONTENT_NEW=all and RECOMP_TEST_CONTENT_NEWS=2)
                                          "create-standard", "room-standard", "rooms-standard", "fighters-standard",
                                          "fighters-new", "vote-new", "hub-news",
+                                         // build 87: content to come at the next release window ("NEW CONTENT AT 17:00")
+                                         "hub-release",
+                                         // build 86: QUICK MATCH set to original fighters only (One on One, King of the
+                                         // Hill), Ranked's skins choice
+                                         "hub-original", "hub-koth-original", "ranked-modes-original",
                                          // build 83: the hub fighter search (a query; one nothing matches)
                                          "fighters-search", "fighters-search-none",
                                          // build 83: the last content sync failed (RECOMP_TEST_CONTENT_SYNC=<reason>), and the
@@ -4887,7 +5347,14 @@ void gallery_step()
                                          // build 64: the relay's restart countdown (it holds new fights)
                                          "maint-hub", "maint-room", "maint-vote",
                                          // build 79: MILESTONES (milestones_ui.inc; the sample profile RICO)
-                                         "milestones", "milestones-tough", "milestones-card", "milestones-chip" };
+                                         "milestones", "milestones-tough", "milestones-card", "milestones-chip",
+                                         // build 86: RUN THE STREETS (closed test): the hub entry, the page, its CPU count
+                                         "hub-rts", "rts", "rts-online",
+                                         // build 87: VS CPU's set-up, a new room's and a room's round rules
+                                         "rts-cpu", "rts-cpu-none", "create-rts", "room-rts",
+                                         // build 86: Run the Streets' social layer (rts_social_ui.inc): the docked
+                                         // chat closed and open on each tab, the chat bubbles and speaker icons
+                                         "rts-dock", "rts-dock-room", "rts-dock-global", "rts-dock-private", "rts-bubbles" };
     const int count = (int)(sizeof(pages) / sizeof(pages[0]));
     static unsigned long long start;
     static int ms;
@@ -4930,7 +5397,7 @@ void gallery_step()
                  main ? main->id : -1, main ? main->name : "");
         G.stats = buf;
         // All servers: US East's and US West's rooms as a player in Europe sees them (112 and 168 ms)
-        static const char *const na_names[] = { "Brooklyn bruisers", "Quick: Rex", "West coast hill" };
+        static const char *const na_names[] = { "Brooklyn bruisers", "Quick: Rex", "Night market" };
         static const int na_modes[] = { 0, 0, NETPLAY_MODE_KOTH_RANDOM };
         for (int i = 0; i < 3; i++) {
             NetServerRoom e = {};
@@ -4984,6 +5451,8 @@ void gallery_step()
     G_hill_hud = NetHillWatch();
     G_hill_menu = NetHillMenu();
     G_hill_menu.auto_ms = G_hill_menu.pick = G_hill_menu.room_ms = -1;
+    g_rts_gallery_tab = -1;
+    g_rts_gallery_world = false;
     S.note_until = 0;
     S.settings_edit = false;
     {   // the relays as a player in Europe sees them, the hub on Europe
@@ -4992,7 +5461,7 @@ void gallery_step()
         eu.online = 142; eu.rooms = 12; eu.waiting = 2; eu.idle = 5; eu.flags = NETSERVER_RANKED | NETSERVER_KOTH; eu.version = 1;
         na.id = "na"; na.name = "US East"; na.short_name = "US EAST"; na.state = NETSERVER_UP; na.ping_ms = 112;
         na.online = 12; na.rooms = 3; na.waiting = 3; na.idle = 1; na.flags = NETSERVER_KOTH; na.version = 1;
-        west.id = "west"; west.name = "US West"; west.short_name = "US WEST"; west.state = NETSERVER_UP; west.ping_ms = 168;
+        west.id = "sg"; west.name = "Asia (Singapore)"; west.short_name = "ASIA"; west.state = NETSERVER_UP; west.ping_ms = 168;
         west.online = 4; west.rooms = 1; west.waiting = 0; west.idle = 2; west.flags = NETSERVER_KOTH; west.version = 1;
         G.servers[NETSERVER_EU] = eu;
         G.servers[NETSERVER_NA] = na;
@@ -5014,10 +5483,13 @@ void gallery_step()
     G.maint_secs = -1;
     QW.open = QW.gallery = false;
     S.skin_open = false;                // build 85: the skin window only on its own page
+    S.unl_open = false;                 // build 86: the community window only on its own page
     G.rollback = G.rb_must = false;
     for (int i = 0; i < NETPLAY_ROOM_SLOTS; i++) G.room_rb[i] = -1;
     G.crew = NetCrew();
     G.my_crew = false;
+    G.original = 0;                     // build 86: all fighters unless the page says
+    G.rts = false;
     std::string p = page;
     // the "-long" pages: Ann's first card plays as the widest 16 characters, Ben's as "Brooklyn Bruiser"
     G.cp_long = p.size() > 5 && p.compare(p.size() - 5, 5, "-long") == 0;
@@ -5052,7 +5524,40 @@ void gallery_step()
         TW.gallery_entry = TS.gallery_entry = p == "hub-crew";
         if (p == "hub-crew-signin") G.account = ACCOUNT_OUT;
     }
+    else if (p == "hub-rts") { S.page = HUB; S.hub_sel = HUB_RTS; G.rts = true; G.ranked = true; }
+    else if (p == "rts") { S.page = RTS; S.rts_sel = 0; S.rts_cpus = 3; G.rts = true; }
+    else if (p == "rts-online") { S.page = RTS; S.rts_sel = 2; G.rts = true; }
+    else if (p == "rts-cpu" || p == "rts-cpu-none") {     // VS CPU's set-up: the defaults; none: 5 knockouts, no time limit
+        S.page = RTS; S.rts_setup = true; S.rts_setup_sel = 1; S.rts_cpus = 3; G.rts = true;
+        G.rts_rules = p == "rts-cpu" ? 0 : ow_rules_rts_encode(OW_RTS_TIME_NONE, 0);
+    }
+    else if (p == "create-rts") {   // a new Run the Streets room: 15 minutes, first to 20; the cursor on TIME LIMIT
+        G.rts = true;
+        rts_room_settings(S.settings, 28);
+        snprintf(S.settings.name, sizeof(S.settings.name), "Ann's room");
+        S.settings.rounds = ow_rules_rts_encode(2, 2);
+        S.settings_edit = false;
+        S.settings_sel = 1;
+        S.page = SETTINGS;
+    }
+    else if (p == "room-rts") {     // a Run the Streets room of 5 minutes, first to 5, on its card
+        S.page = HUB;
+        G.room = sample_room(NETPLAY_MODE_RTS, 4, 2);
+        G.room.settings.rounds = ow_rules_rts_encode(0, 0);
+    }
+    else if (p == "rts-dock") g_rts_gallery_tab = 3;
+    else if (p == "rts-dock-room") g_rts_gallery_tab = 0;
+    else if (p == "rts-dock-global") g_rts_gallery_tab = 1;
+    else if (p == "rts-dock-private") g_rts_gallery_tab = 2;
+    else if (p == "rts-bubbles") g_rts_gallery_world = true;
     else if (p == "hub-rollback-restart") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }   // build 46: the restart notice
+    else if (p == "hub-original" || p == "hub-koth-original") {     // build 86: QUICK MATCH, original fighters only
+        S.page = HUB;
+        S.hub_sel = 0;
+        std::vector<int> cycle = mode_cycle();
+        S.quick_mode = p == "hub-original" ? 0 : cycle_index(cycle, NETPLAY_MODE_KOTH_RANDOM);
+        G.original = 1u << 0 | 1u << 24 | 1u << 25;
+    }
     else if (p == "hub-team" || p == "hub-special" || p == "hub-koth" || p == "hub-rot") {     // QUICK MATCH with Team, Inferno, King of the Hill or FFA rotation
         S.page = HUB;
         S.hub_sel = 0;
@@ -5107,6 +5612,7 @@ void gallery_step()
         S.vote_sel = 1;
     }
     else if (p == "hub-news") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }
+    else if (p == "hub-release") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }
     else if (p == "hub-sync-failed") { S.page = HUB; S.hub_sel = 0; S.quick_mode = 0; }
     else if (p == "rooms-split" || p == "rooms-sync-failed") {     // 22 on Europe, 1 of them on this PC's content
         S.page = ROOMS;
@@ -5173,6 +5679,28 @@ void gallery_step()
                 S.skin_opened = GetTickCount64();
                 break;
             }
+    }
+    else if (p == "fighters-community" || p == "fighters-more") {   // build 86: the shelf, or MORE's window open
+        S.page = FIGHTERS;
+        S.fighter_top = 0;
+        const auto &list = grid_fighters();
+        for (int i = 0; i < (int)list.size(); i++)
+            if (list[i].id >= FB_FIRST_LOGICAL && (p == "fighters-community" || list[i].id == FB_MORE_ID)) {
+                S.fighter_sel = i;
+                S.fighter_top = i / 7 > 3 ? i / 7 - 3 : 0;
+                if (list[i].id == FB_MORE_ID) {
+                    S.unl_open = true;
+                    S.unl_sel = 13;
+                    S.unl_opened = GetTickCount64();
+                }
+                break;
+            }
+    }
+    else if (p == "room-community") {   // build 86: two players with community fighters, their portraits by number
+        S.page = HUB;
+        G.room = sample_room(2, 4, 3);
+        for (int i = 0; i < G.room.player_count && i < 2; i++)
+            if (const FighterBanksEntry *e = fighter_banks_at(i * 7)) G.room.players[i].fighter = e->id;
     }
     else if (p == "fighters-rules") {   // a room of stock fighters and no banned tier: two fighters blocked, one chosen
         S.page = FIGHTERS;
@@ -5590,6 +6118,9 @@ bool decor_wanted()
 ImVec4 g_exit_chip;                 // the chip's rectangle in window pixels, as last drawn
 long long g_exit_chip_ms = 0;       // when it was last drawn
 struct ExitPrompt { int sel = 1; long long opened = 0; } X;     // sel 0 YES, 1 NO
+// build 86: the UPDATE NOW prompt (sel 0 UPDATE NOW, 1 LATER)
+struct UpdatePrompt { bool open = false, test_done = false; int sel = 0; long long opened = 0; char where[64] = "";
+                      char refused[160] = ""; } UP;
 
 bool exit_wanted()
 {
@@ -5637,6 +6168,42 @@ bool draw_skin_window(ImVec2 display)
     } else {
         fighter_skins_set_slot(g_sw.slot, g_sw.fe, 0);
         fprintf(stderr, "[SKINS] skin window: back (slot %d keeps the fighter's own look)\n", g_sw.slot);
+    }
+    return true;
+}
+
+// ---- the community window behind the select grid's MORE cell (community_ui.inc, fighter_banks.h) ----
+
+static struct { int slot, sel; ULONGLONG opened; } g_cw;
+
+bool take_community_window_request()
+{
+    int slot;
+    if (!fighter_banks_take_window(&slot)) return false;
+    g_cw.slot = slot;
+    const FighterBanksEntry *e = fighter_banks_bound(slot);
+    g_cw.sel = 0;
+    for (int i = 0; e && i < fighter_banks_count(); i++)
+        if (fighter_banks_at(i)->id == e->id) g_cw.sel = i;
+    g_cw.opened = GetTickCount64();
+    { Pad none = {}; community_test_keys(none, true); }
+    fprintf(stderr, "[BANKS] community window: slot %d, %d fighters, on %d\n", slot, fighter_banks_count(), g_cw.sel);
+    return true;
+}
+
+bool draw_community_window(ImVec2 display)
+{
+    Frame f = menu_frame(display);
+    Pad idle = {};
+    Pad pad = GetTickCount64() - g_cw.opened > 300 ? read_pad() : idle;    // not the A that picked MORE
+    int r = community_window(ImGui::GetForegroundDrawList(), f, pad, &g_cw.sel);
+    if (!r) return false;
+    if (r == 1) {
+        const FighterBanksEntry *e = fighter_banks_at(g_cw.sel);
+        if (e) fighter_banks_bind(g_cw.slot, e->id);
+        fprintf(stderr, "[BANKS] community window: slot %d takes %d\n", g_cw.slot, e ? e->id : -1);
+    } else {
+        fprintf(stderr, "[BANKS] community window: back (slot %d keeps what MORE gave it)\n", g_cw.slot);
     }
     return true;
 }
@@ -5737,6 +6304,96 @@ int draw_exit_prompt(ImVec2 display)
     fprintf(stderr, "[UI] exit prompt: %s\n", choose == 0 ? "yes, quitting" : "no");
     fflush(stderr);
     return choose == 0 ? 2 : 1;
+}
+
+// ---- UPDATE NOW (build 86, content_update.c) -------------------------------------------------------
+// "NEW COMMUNITY CONTENT IS OUT" with UPDATE NOW and LATER: the main menu's popup (the overlay opens it once per
+// news and after each fight), the hub's Y, and a room refused for other packs (ERROR 15). The pad: left/right and
+// A, B is LATER; the keyboard and the mouse as in the exit prompt. UPDATE NOW is refused in a fight, a match or a
+// room's countdown (the line says why; LATER closes it). RECOMP_TEST_UPDATE_ANSWER=now|later answers after 2.5 s.
+
+void update_prompt_begin(const char *where)
+{
+    UP = UpdatePrompt();
+    UP.open = true;
+    UP.opened = now_ms();
+    snprintf(UP.where, sizeof(UP.where), "%s", where ? where : "?");
+    fprintf(stderr, "[UI] UPDATE NOW prompt opened (%s)\n", UP.where);
+    fflush(stderr);
+}
+
+int draw_update_prompt(ImVec2 display, bool main_menu)
+{
+    if (main_menu && !exit_wanted() && !gallery_on()) {
+        fprintf(stderr, "[UI] UPDATE NOW prompt: closed, the main menu is gone\n");
+        return 3;
+    }
+    if (!UP.opened) update_prompt_begin(main_menu ? "main menu" : "online screens");
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    Frame f = menu_frame(display);
+    char names[256], line[300];
+    int n = gallery_on() ? pc_content_news(names, sizeof(names)) : content_news(names, sizeof(names));
+    dl->AddRectFilled(ImVec2(0, 0), display, IM_COL32(0, 0, 0, 160));
+    const float px = 130, py = 140, pw = 380, ph = 200;
+    glass(dl, f, px, py, pw, ph, 14, IM_COL32(10, 10, 13, 255), 0.88f);
+    rect(dl, f, px, py, 6, ph, RED, 3);
+    text(dl, f, g_title, 22, 320, py + 16, CREAM, "NEW COMMUNITY CONTENT IS OUT", CENTER, 1.6f);
+    snprintf(line, sizeof(line), "%d new pack%s%s%s", n, n == 1 ? "" : "s", names[0] ? ": " : "", names);
+    text(dl, f, g_hand, std::max(10.0f, fit_size(f, g_hand, 15, line, 340)), 320, py + 46, ORANGE, line, CENTER, 1.0f, 340);
+    const char *say_line = UP.refused[0] ? UP.refused : "Update now? The game closes, gets them and comes back by itself.";
+    text(dl, f, g_body, std::max(9.0f, fit_size(f, g_body, 12, say_line, 340)), 320, py + 76,
+         UP.refused[0] ? RED : with_alpha(CREAM, 0.9f), say_line, CENTER, 0.6f, 340);
+    const float by = py + 112, bh = 34, bw = 150;
+    const float bx[2] = { 320 - 10 - bw, 320 + 10 };
+    const char *label[2] = { "UPDATE NOW", "LATER" };
+    int choose = -1;
+    for (int i = 0; i < 2; i++) {
+        if (mouse_pick(f, bx[i], by, bw, bh)) UP.sel = i;
+        if (mouse_click(f, bx[i], by, bw, bh)) choose = i;
+        bool sel = UP.sel == i;
+        glass(dl, f, bx[i], by, bw, bh, 7, sel ? RED : IM_COL32(10, 10, 13, 255), sel ? 0.92f : 0.6f);
+        text(dl, f, g_title, 18, bx[i] + bw / 2, by + 7, sel ? WHITE : GREY, label[i], CENTER, 1.2f);
+    }
+    float hx = px + 120;
+    hx += hint(dl, f, hx, py + ph - 28, "a", "SELECT");
+    hint(dl, f, hx, py + ph - 28, "b", "LATER");
+
+    auto pressed = [](std::initializer_list<ImGuiKey> keys) {
+        for (ImGuiKey k : keys) if (ImGui::IsKeyPressed(k, false)) return true;
+        return false;
+    };
+    bool settled = now_ms() - UP.opened > 400;      // not the press that opened it
+    if (settled) {
+        if (pressed({ ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadLStickLeft, ImGuiKey_LeftArrow, ImGuiKey_A })) UP.sel = 0;
+        if (pressed({ ImGuiKey_GamepadDpadRight, ImGuiKey_GamepadLStickRight, ImGuiKey_RightArrow, ImGuiKey_D })) UP.sel = 1;
+        if (pressed({ ImGuiKey_Tab })) UP.sel ^= 1;
+        if (pressed({ ImGuiKey_GamepadFaceDown, ImGuiKey_Enter, ImGuiKey_KeypadEnter, ImGuiKey_Space, ImGuiKey_K }))
+            choose = UP.sel;
+        if (pressed({ ImGuiKey_GamepadFaceRight, ImGuiKey_Escape, ImGuiKey_Backspace, ImGuiKey_L })) choose = 1;
+    } else {
+        choose = -1;
+    }
+    {   // tests: RECOMP_TEST_UPDATE_ANSWER=now|later
+        static const char *test = getenv("RECOMP_TEST_UPDATE_ANSWER");
+        if (test && *test && now_ms() - UP.opened > 2500 && !UP.test_done) {
+            UP.test_done = true;
+            choose = !strcmp(test, "later") ? 1 : 0;
+            fprintf(stderr, "[UI] UPDATE NOW prompt (test): %s\n", choose ? "LATER" : "UPDATE NOW");
+        }
+    }
+    if (choose < 0) return 0;
+    if (choose == 1) {
+        fprintf(stderr, "[UI] UPDATE NOW prompt: later\n");
+        return 1;
+    }
+    if (gallery_on()) return 0;
+    char why[160];
+    if (content_update_request(UP.where, why, sizeof(why)) != CU_OK) {
+        snprintf(UP.refused, sizeof(UP.refused), "%s", why);
+        UP.sel = 1;
+        return 0;
+    }
+    return 2;
 }
 
 // ---- MILESTONES (build 79, milestones_ui.inc) ------------------------------------------------------
@@ -6022,6 +6679,38 @@ bool draw_fight_chat(ImDrawList *dl, ImVec2 display)
 
 bool fight_chat_typing() { return FC.typing || (QW.open && QW.where == QW_FIGHT); }
 
+int fight_chat_keys()
+{
+    try {
+        return fight_chat_keys_impl();
+    } catch (...) {
+        return RTS_CHAT_NONE;
+    }
+}
+
+bool fight_chat_at(float x, float y) { return rts_dock_at(x, y); }
+
+// Run the Streets: the chat bubbles and speaker icons over the fighters (rts_social_ui.inc), drawing only.
+bool rts_world_wanted()
+{
+    try {
+        return rts_world_draw_impl(nullptr, ImVec2(0, 0), false);
+    } catch (...) {
+        return false;
+    }
+}
+
+void draw_rts_world(ImDrawList *dl, ImVec2 display)
+{
+    try {
+        rts_world_draw_impl(dl, display, true);
+    } catch (const std::exception &e) {
+        ui_caught("chat bubbles", e.what());
+    } catch (...) {
+        ui_caught("chat bubbles", nullptr);
+    }
+}
+
 bool test_pad(int *buttons, float *lx, float *ly)
 {
     *buttons = QT.buttons;
@@ -6035,6 +6724,7 @@ bool test_pad_r3() { return quick_button() == ImGuiKey_GamepadR3; }
 const char *shot_label()
 {
     if (const char *chat = chat_shot_label()) return chat;
+    if (const char *rts = rts_shot_label()) return rts;
     if (g_fight_chat_up && !gallery_on()) return fight_chat_shot_label();
     if (!gallery_on() && !g_versus_up && net_state() != NETPLAY_CONNECTED) {    // the crew battle screen (stage 3)
         NetRoom r;
@@ -6053,7 +6743,8 @@ const char *shot_label()
 
 bool take_open_request()
 {
-    if (!g_open_req.exchange(0)) return false;
+    // build 86: started again by UPDATE NOW: back where the player pressed it, the online hub
+    if (!g_open_req.exchange(0) && !(exit_wanted() && content_update_take_open_hub())) return false;
     S = State();
     S.opened = GetTickCount64();
     C.open = C.kb = C.menu = false;
@@ -6103,6 +6794,13 @@ bool draw_unguarded(ImVec2 display)
         return keep;
     }
     if (!(net_state() == NETPLAY_CONNECTED && net_in_lobby())) chat_draw(dl, f, display);
+    if (UP.open) {      // build 86: over the page and the chat
+        int answer = draw_update_prompt(display, false);
+        if (answer) {
+            content_update_offer_answer(answer == 1);
+            UP.open = false;
+        }
+    }
     // the quick-chat wheel over the page or the chat window (gallery: the picture alone)
     if (QW.open && QW.where != QW_FIGHT) {
         C.mouse_off = !QW.gallery;
@@ -6121,6 +6819,9 @@ bool draw_pages(ImVec2 display)
     // the first frame takes no choice: the A that opened the screens is still down
     if (GetTickCount64() - S.opened < 250) pad = Pad();
     if (C.open) pad = Pad();       // the chat window has the input
+    if (UP.open) pad = Pad();      // build 86: the UPDATE NOW prompt has it
+    if (!gallery_on() && !UP.open && content_update_take_refusal_offer() && content_news(nullptr, 0) > 0)
+        update_prompt_begin("refused for other community packs");     // ERROR 15 with news out
     if ((QW.open && QW.where != QW_FIGHT && !QW.gallery) || (C.kb && C.kb_kind == KB_QUICK)) pad = Pad();   // the wheel, or the QUICK CHAT page's keyboard
     if (gallery_on()) {
         gallery_step();
@@ -6140,6 +6841,11 @@ bool draw_pages(ImVec2 display)
     if (gallery_on() && G_hill_hud.count) {     // the spectator HUD's pages: over a stand-in for the fight
         backdrop(dl, f, display, true, LOOK_MATCH);
         hill_hud(dl, f, G_hill_hud, room);
+        return true;
+    }
+    if (gallery_on() && (g_rts_gallery_tab >= 0 || g_rts_gallery_world)) {     // build 86: Run the Streets' social layer
+        backdrop(dl, f, display, true, LOOK_MATCH);
+        rts_gallery_page(dl, display);
         return true;
     }
     if (gallery_on() && G_hill_menu.results) {  // build 73: the results' strip, over a stand-in for them
@@ -6201,6 +6907,29 @@ bool draw_pages(ImVec2 display)
         if (st == NETPLAY_LOBBY) S.fallback_tried = false;
         ranked_tick(room);
     }
+    {   // tests: RECOMP_TEST_OPEN_ONLINE=rts opens RUN THE STREETS itself (with access), connected or not
+        static int once;
+        const char *v = getenv("RECOMP_TEST_OPEN_ONLINE");
+        if (!once && v && !strcmp(v, "rts") && !gallery_on() && rts_access()) { once = 1; open_rts(); }
+    }
+    // RUN THE STREETS' VS CPU needs no relay: its page and its fighter pick work without a connection.
+    if (!room.in_room && !gallery_on() && (S.page == RTS || (S.page == FIGHTERS && S.rts_pick)) &&
+        net_state() != NETPLAY_LOBBY) {
+        if (S.page == RTS) {
+            draw_rts(dl, f, pad);
+        } else {
+            bool chosen = false;
+            int fighter = 0;
+            draw_fighters(dl, f, pad, &chosen, &fighter);
+            if (chosen) { S.rts_pick = false; rts_fighter_chosen(fighter); }
+            float hx = 54;
+            hx += hint(dl, f, hx, 420, "a", "PICK");
+            hint(dl, f, hx, 420, "b", "BACK");
+        }
+        draw_status(dl, f);
+        if (g_rts_close) { g_rts_close = false; return false; }
+        return !(pad.b && S.page == HUB);
+    }
     // The picker works without a connection: a server that does not answer is left from here.
     if (S.page == SERVERS && !room.in_room && st != NETPLAY_CONNECTED) {
         draw_servers(dl, f, pad);
@@ -6238,7 +6967,7 @@ bool draw_pages(ImVec2 display)
         }
         door_panel(dl, f);
         door_text(dl, f, &tex("ui/online_icon.png"), "ONLINE", pending ? "CHOOSING A SERVER" : "CONNECTING",
-                  pending ? pad_text("Europe, US East or US West: the one with the lowest ping. Change it any time with "
+                  pending ? pad_text("Europe, US East or Asia: the one with the lowest ping. Change it any time with "
                                      "{x} in the online menu.").c_str()
                           : "To the FFNY Online server.");
         float hx = 54;
@@ -6292,7 +7021,9 @@ bool draw_pages(ImVec2 display)
         if (chosen) {
             recomp_settings_set("online", "fighter", fighter);
             recomp_settings_set("online", "fighter_skin", S.pick_skin);     // build 85: READY's skin (netplay.c)
-            if (S.ranked_pick && !room.in_room) {
+            if (S.rts_pick && !room.in_room) {
+                rts_fighter_chosen(fighter);
+            } else if (S.ranked_pick && !room.in_room) {
                 ranked_search(fighter);
                 S.page = RANKED;
             } else {
@@ -6312,9 +7043,10 @@ bool draw_pages(ImVec2 display)
                 S.page = HUB;
             }
             S.ranked_pick = false;
+            S.rts_pick = false;
         }
-        if (S.page == HUB) S.ranked_pick = false;
-        if (S.page == FIGHTERS) {
+        if (S.page == HUB) S.ranked_pick = S.rts_pick = false;
+        if (S.page == FIGHTERS && !S.unl_open) {     // build 86: the community window has its own hints
             float hx = 54;
             hx += hint(dl, f, hx, 420, "a", "PICK");
             if (S.fighters_cp >= 0) hx += hint(dl, f, hx, 420, "y", "ONLINE NAME");     // a created fighter's card
@@ -6369,6 +7101,8 @@ bool draw_pages(ImVec2 display)
         (void)hx;
     } else if (S.page == MUSIC && !(room.in_room && room.phase != 0)) {
         draw_music(dl, f, pad);
+    } else if (S.page == RTS && !room.in_room) {
+        draw_rts(dl, f, pad);
     } else if (S.page == QUICK && !(room.in_room && room.phase != 0)) {
         draw_quick_page(dl, f, pad, display);
     } else if (S.page == CODE) {
@@ -6396,11 +7130,13 @@ bool draw_pages(ImVec2 display)
                 hx += hint(dl, f, hx, 424, "a", "SELECT");
                 hx += hint(dl, f, hx, 424, "b", "BACK");
             }
+            if (S.hub_sel == 0) hx += hint(dl, f, hx, 424, "lb", "FIGHTERS");     // build 86: original only or all
             hint(dl, f, hx, 424, "rb", "MY MUSIC");     // build 82: the player's songs, their order
             if (pad.rb && S.page == HUB) open_music();
         }
         if ((pad.a && S.hub_sel == HUB_LEAVE) || pad.b) keep = false;
     }
+    if (g_rts_close) { g_rts_close = false; keep = false; }     // an offline Run the Streets fight starts
     {   // build 46: the server allows rollback again, but this session started without it (once per session)
         static bool told;
         int caps = lobby_caps();
@@ -6430,6 +7166,8 @@ void prepare(void *) {}
 bool decor_wanted() { return false; }
 void draw_decor(ImDrawList *, ImVec2) {}
 bool exit_wanted() { return false; }
+void update_prompt_begin(const char *) {}
+int draw_update_prompt(ImVec2, bool) { return 1; }
 bool exit_chip_at(float, float) { return false; }
 bool take_exit_test_request() { return false; }
 void exit_prompt_begin() {}
@@ -6458,6 +7196,8 @@ void draw_fight_hud(ImDrawList *, ImVec2) {}
 bool fight_chat_wanted() { return false; }
 bool draw_fight_chat(ImDrawList *, ImVec2) { return false; }
 bool fight_chat_typing() { return false; }
+int fight_chat_keys() { return 0; }
+bool fight_chat_at(float, float) { return false; }
 bool test_pad(int *b, float *x, float *y) { *b = 0; *x = *y = 0; return false; }
 bool test_pad_r3() { return false; }
 }

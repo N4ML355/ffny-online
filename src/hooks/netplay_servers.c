@@ -23,7 +23,7 @@ static const struct {
     { "eu", "Europe", "EU", "play.defjam.online:27777", "49.12.78.32", "RECOMP_NETPLAY_SERVER_EU" },
     /* build 38: the North American relay of builds 30..37 is US East; its id stays "na" */
     { "na", "US East", "US EAST", "na.defjam.online:27777", "5.161.206.134", "RECOMP_NETPLAY_SERVER_NA" },
-    { "west", "US West", "US WEST", "west.defjam.online:27777", "5.78.214.178", "RECOMP_NETPLAY_SERVER_WEST" },
+    { "sg", "Asia (Singapore)", "ASIA", "sg.defjam.online:27777", "5.223.88.150", "RECOMP_NETPLAY_SERVER_SG" },
 };
 
 static const char *setting_server(char *buf, int size)
@@ -31,7 +31,7 @@ static const char *setting_server(char *buf, int size)
     return recomp_settings_get_text("online", "server", buf, (size_t)size, "auto");
 }
 
-/* The setting's text (netservers_parse_choice): auto, eu, na, west, all; the old "both" is all. */
+/* The setting's text (netservers_parse_choice): auto, eu, na, sg, all; the old "both" is all. */
 enum NetServerChoice netservers_choice(void)
 {
     char buf[128];
@@ -985,7 +985,8 @@ int netservers_quick_move(int mode, int search_s, int alone_s, const char *code,
                           unsigned *scope_out)
 {
     NetServerInfo sv[NETSERVER_COUNT];
-    int cur = netservers_connected(), my_age = alone_s, best = -1, best_n = 0, o, k;
+    int cur = netservers_connected(), my_age = alone_s, best = -1, best_n = 0, o, k, std_room;
+    int original = netplay_original(mode);
     unsigned up = 0, scope, soon;
     enum NetServerChoice c = netservers_choice();
     ULONGLONG now;
@@ -1017,6 +1018,12 @@ int netservers_quick_move(int mode, int search_s, int alone_s, const char *code,
                 int age = R.age[o][k] + (int)((now - R.got[o]) / 1000);
                 if (x->mode != mode || x->phase != 0 || x->players < 1 || x->players >= x->max) continue;
                 if (strncmp(x->name, "Quick: ", 7)) continue;   /* the relay quick-joins only quick rooms */
+                /* build 86 (server relay/original.go): an original-only search meets original-only rooms alone; an
+                 * all-fighters one goes to an original-only room whatever its age, since that room's player never
+                 * moves to an all-fighters room (so the two never cross) */
+                std_room = x->rules >= 0 && (x->rules & NETPLAY_RULES_STANDARD) != 0;
+                if (original && !std_room) continue;
+                if (!original && std_room) { n += x->players; continue; }
                 if (netservers_should_move(cur, my_age, o, age)) n += x->players;
             }
         } else if (sv[o].waiting > 0 && alone_s >= QUICK_LAST_S) {

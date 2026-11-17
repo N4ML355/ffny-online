@@ -34,6 +34,7 @@
 #include "hooks/pc_launcher_saves.h"
 #include "hooks/test_observations.h"
 #include "hooks/new_fighters.h"
+#include "hooks/fighter_banks.h"
 #include "hooks/pc_settings.h"
 #include "recomp_settings.h"
 #include "hooks/netplay.h"
@@ -53,6 +54,8 @@
 #include "hooks/memcard_fast.h"
 #include "patches/picture.h"
 #include "patches/cheats.h"
+#include "patches/song_trace.h"     /* RECOMP_SONG_TRACE */
+#include "patches/song_shuffle.h"   /* the shuffled playlist, evenly */
 #include "patches/online_guard.h"   /* cheats refused while online */
 #include "patches/menu_geometry.h"
 #include "hooks/dynload_guard.h"
@@ -67,8 +70,11 @@ void defjam_crowd_step(void);
 /* Read-only probes use the lifter's universal entry hooks. They do not alter
  * guest registers, stack, memory or the generated body. Off in normal play. */
 void sub_001A4A30_enter(void) { defjam_test_update(); }
+void ow_hit(uint32_t attacker, uint32_t defender);         /* Big Arena knockout credit (openworld.c) */
+void ow_health_change(void);                                /* Big Arena respawn protection (openworld.c) */
 void sub_001A5DD0_enter(void)
 {
+    ow_hit(MEM32(g_esp + 4), MEM32(g_esp + 8));
     if (defjam_test_observations_enabled())
         defjam_test_hit(MEM32(g_esp + 4), MEM32(g_esp + 8), MEM32(g_esp));
 }
@@ -78,6 +84,28 @@ void sub_001A50B0_enter(void)
         defjam_test_health_begin(MEM32(g_esp + 4), MEM32(g_esp));
     if (!ffny_online_locked())
         cheats_health_change(); /* [cheats] infinite_health, no_regen (src/patches/cheats.c); never online */
+    ow_health_change();
+}
+void ow_roam_input(uint32_t rec);     /* Run the Streets free roam: the target cache and inputs (openworld.c) */
+void ow_roam_walk(void);              /* Run the Streets free roam: the walking speed (openworld.c) */
+/* sub_001BA800 (the input history) runs for each fighter right after sub_001A4A30 cached its target's angle and
+ * distance (+0x838/+0x834) and before the state handlers; sub_001CAC40 is the walker (record, held bits, speed). */
+void sub_001BA800_enter(void) { ow_roam_input(MEM32(g_esp + 4)); }
+void sub_001CAC40_enter(void) { ow_roam_walk(); }
+/* The fight HUD's clock, top centre (thiscall (hud), no stack arguments; called by the HUD's update sub_000B5710
+ * only): it writes the match's minutes and seconds (0x3BE0EC / 0x3BE0F0, counting up; "5:00 minus them" in the
+ * game's timed matches) at the hud.xsh locator text_time (+0x5FC / +0x600) and runs the flash of its last seconds.
+ * Build 87: a Run the Streets fight leaves it out, because the score plate's round clock counts down to the
+ * room's time limit (fight_hud_ui.inc) and two clocks running opposite ways confused the first testers. Every other
+ * fight draws it as before. RECOMP_RTS_GAME_CLOCK=1 keeps it (tests). */
+int ow_rts_active(void);
+extern void sub_000B54E0_gen(void);
+void sub_000B54E0(void)
+{
+    static int keep = -1;
+    if (keep < 0) keep = getenv("RECOMP_RTS_GAME_CLOCK") != NULL;
+    if (!keep && ow_rts_active()) { g_esp += 4; return; }
+    sub_000B54E0_gen();
 }
 void sub_001A6870_enter(void)
 {
@@ -113,12 +141,39 @@ void sub_00087700_enter(void)
     if (!ffny_online_locked())
         cheats_fight_step();    /* [cheats] fight cheats (src/patches/cheats.c); never online */
 }
+/* Open-world phase 0 (src/hooks/openworld.c, RECOMP_OW_*; each wrapper only calls the generated body
+ * unless its switch is set): the fight step and the collision sweep timed, the plane test counted,
+ * and the camera wrapper followed by the host-side follow camera. */
+void ow_step(void (*gen)(void));
+void ow_sweep(void (*gen)(void));
+void ow_plane_test(void (*gen)(void));
+void ow_camera(void (*gen)(void));
+extern void sub_00087700_gen(void);
+void sub_00087700(void) { ow_step(sub_00087700_gen); }
+extern void sub_001AC490_gen(void);
+void sub_001AC490(void) { ow_sweep(sub_001AC490_gen); }
+extern void sub_001ABFA0_gen(void);
+void sub_001ABFA0(void) { ow_plane_test(sub_001ABFA0_gen); }
+extern void sub_000AC590_gen(void);
+void sub_000AC590(void) { ow_camera(sub_000AC590_gen); }
+/* Big Arena (src/hooks/openworld.c): the match-end decision (sub_001A6750, no arguments, eax = 1 when the match is
+ * over) keeps a free-for-all going until the score or time limit, and the result recorder (sub_001A6A80, cdecl
+ * winners, losers, code) records no knockout of a fighter that comes back. Both call the generated body unchanged
+ * when the mode is off. */
+void ow_match_end_check(void (*gen)(void));
+void ow_result_record(void (*gen)(void));
+extern void sub_001A6750_gen(void);
+void sub_001A6750(void) { ow_match_end_check(sub_001A6750_gen); }
+extern void sub_001A6A80_gen(void);
+void sub_001A6A80(void) { ow_result_record(sub_001A6A80_gen); }
 /* The match's update (thiscall; the match at 0x349760, its state at +0x2D820).
  * Only states 5 and 8 run the simulation step above; any other state (intro,
  * special-move camera, match end) ends the live HUD. */
+void ow_match_update(uint32_t match);
 void sub_0008BE60_enter(void)
 {
     uint32_t state = MEM32(g_ecx + 0x2D820);
+    ow_match_update(g_ecx);
     if (state != 5 && state != 8)
         s_ws_hud_live = 0;
 }
@@ -130,12 +185,14 @@ void sub_0008BE60_enter(void)
 void sub_00079B60_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
 void sub_0007A8F0_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
 static void crowd_guard_match_start(void);
+void ow_match_start(void);
 void sub_001A4D90_enter(void)
 {
     new_fighters_fight_setup();     /* a new fighter's style combination (src/hooks/new_fighters.c) */
     defjam_test_match_start();
     defjam_crowd_match_start();
     netplay_on_match_start();
+    ow_match_start();           /* Big Arena (src/hooks/openworld.c): scores, spawns, the mode for this fight */
     crowd_guard_match_start();
     cheats_match_start();       /* [cheats] (src/patches/cheats.c): a step count and logs only */
     if (combo_log_on()) combo_log_match_start();
@@ -162,7 +219,7 @@ void sub_001C6CD0_enter(void)
  * stack argument. */
 void ws_apt_load_begin(uint32_t name);
 void ws_apt_load_done(uint32_t apt);
-void sub_001810B0_enter(void) { ws_apt_load_begin(MEM32(g_esp + 8)); }
+void sub_001810B0_enter(void) { ws_apt_load_begin(MEM32(g_esp + 8)); fighter_banks_movie_load(g_esp + 8); }
 void sub_00056F50_enter(void) { ws_apt_load_done(MEM32(g_esp + 8)); }
 /* DynamicLoader's ELF parser: the input descriptor's +0x10 is the raw header,
  * still before section fixup, relocation and vertex-buffer upload. */
@@ -245,16 +302,53 @@ static void id_set_full(uint32_t set, uint32_t id)
         fprintf(stderr, "[SETS] the set at %08X holds %u of %u ids: id %08X left out (%u so far)\n", set,
                 MEM32(set + 4), MEM32(set), id, refused);
 }
+/* A full fighter set with a new fighter's id in it (unlock_all, or a story reward, put every Character row in,
+ * new fighters' rows too): a stock fighter's id takes that place, since the new fighter does not need it. Else a
+ * stock fighter bought in Unlock Rewards would cost its points and stay locked. 1 when a place was made. */
+static int id_set_make_room(uint32_t set, uint32_t id)
+{
+    uint32_t count = MEM32(set + 4), ids = MEM32(set + 0xC), saved = MEM32(set + 8), i, j;
+    if (id >> 24 != 7u || new_fighter_row(id & 0x7FFFFFu) || !ids || count > MEM32(set))
+        return 0;
+    for (i = count; i-- > 0;) {
+        uint32_t v = MEM32(ids + 4 * i);
+        if (v >> 24 != 7u || !new_fighter_row(v & 0x7FFFFFu))
+            continue;
+        for (j = i; j + 1 < count; j++)
+            MEM32(ids + 4 * j) = MEM32(ids + 4 * (j + 1));
+        MEM32(ids + 4 * (count - 1)) = 0xFFFFFFFFu;
+        MEM32(set + 4) = count - 1;
+        if (saved)
+            MEM32(saved) = count - 1;
+        fprintf(stderr, "[SETS] the fighter set was full: new fighter id %08X made room for %08X\n", v, id);
+        return 1;
+    }
+    return 0;
+}
 extern void sub_00016810_gen(void);
 void sub_00016810(void)
 {
     uint32_t set = g_ecx;
-    if (MEM32(set + 4) >= MEM32(set)) {
+    if (MEM32(set + 4) >= MEM32(set) && !id_set_make_room(set, MEM32(MEM32(g_esp + 4)))) {
         id_set_full(set, MEM32(MEM32(g_esp + 4)));
         g_esp += 8;     /* ret 4: the return address and the id pointer */
         return;
     }
     sub_00016810_gen();
+}
+/* The database's record lookup (sub_000BE760: thiscall on the database, (out, item ID, 0), ret 12; out[0] the
+ * record, out[1] the database, out[2] its type): a bank row of a slot bound to a community fighter beyond the
+ * places answers with that fighter's record (unindexed in the same database), so everything the match reads from
+ * the row is the fighter's (src/hooks/fighter_bank_hooks.c; Vlad's participant window does the same). */
+extern void sub_000BE760_gen(void);
+void sub_000BE760(void)
+{
+    uint32_t database = g_ecx, output = MEM32(g_esp + 4), caller = MEM32(g_esp), record, bound;
+    sub_000BE760_gen();
+    if (output < 0x10000u) return;
+    record = MEM32(output);
+    bound = fighter_banks_record(database, record, caller);
+    if (bound != record) MEM32(output) = bound;
 }
 /* The load (sub_00014540, thiscall on the record, ret 4) copies the saved record (record + 0x4C .. + 0x14DC)
  * back over the live one, the saved counts and the song store's buffers included. A save written while the
@@ -352,6 +446,18 @@ void sub_00014540(void)
         fprintf(stderr, "[SETS] the save's song list was damaged (%u unknown key(s)%s): every song starts again "
                         "as never arranged\n", bad, fighters_over ? ", fighter ids over its states" : "");
     }
+}
+/* The shuffled music playlist builder (thiscall on the profile's song store, (names[] out, count* out),
+ * ret 8; the menus' sub_0003DA40 and sub_0003DF9C, the fights' sub_0001F7E0). Its collision rule (the lowest
+ * free slot) puts songs from the first half of the Song table at the front of the list nearly every time, so
+ * late songs such as "Get It Now" almost never played (retail bug, 2026-11-16 report). The game's builder
+ * runs as it is; its list is then reordered evenly on the host: src/patches/song_shuffle.c. */
+extern void sub_00020D70_gen(void);
+void sub_00020D70(void)
+{
+    uint32_t names = MEM32(g_esp + 4), count_ptr = MEM32(g_esp + 8);
+    sub_00020D70_gen();
+    song_shuffle_after_build(names, count_ptr);
 }
 /* The audio subsystem's per-frame update (cdecl (frame), called directly by every screen's update:
  * sub_00079B60 and five others). It walks the game's cue queue and voices (sub_0003D560 ->
@@ -609,7 +715,9 @@ static void crowd_guard(uint32_t crowd)
 void sub_000DB870_enter(void) { defjam_test_crowd_update(); defjam_crowd_update(); crowd_guard(g_ecx); }
 /* The per-fighter pad reader: RECOMP_TEST_INPUT replaces what it is about to read, and so
  * does online play, with the entry both PCs agreed on for this step. */
-void sub_001BAA00_enter(void) { defjam_test_input(MEM32(g_esp + 4)); netplay_on_pad_read(MEM32(g_esp + 4)); }
+void ow_pad_read(uint32_t actor);     /* Big Arena "behind" camera: the stick turned by the camera (openworld.c) */
+void ow_pad_hold(uint32_t actor);     /* Big Arena TIME!: every fighter at rest while TIME! and the winner show (openworld.c) */
+void sub_001BAA00_enter(void) { defjam_test_input(MEM32(g_esp + 4)); ow_pad_read(MEM32(g_esp + 4)); netplay_on_pad_read(MEM32(g_esp + 4)); ow_pad_hold(MEM32(g_esp + 4)); }
 /* Rollback (src/hooks/rollback.c). The main loop's dt read is the first call of every game
  * update, so its entry is the clean point between two updates: save, load and re-run there.
  * The audio subsystem's start-up brackets the memory the sound engine and its mixer thread
@@ -1116,6 +1224,7 @@ void sub_00077040_enter(void)
 {
     screen_swap_guard();
     dev_module_manager_enter();
+    song_trace_tick();          /* RECOMP_SONG_TRACE only: src/patches/song_trace.c */
     if (!ffny_online_locked())
         cheats_game_tick();     /* Story cheats, src/patches/cheats.c; never online */
 }
@@ -1910,6 +2019,9 @@ static void funccall_hook(void)
         text[i] = c;
     }
     text[i] = 0;
+    /* A ControllerSetup with a community fighter beyond the places (ID 1000 and up) reaches the game with the
+     * slot's bank; the original command string stays as it was (src/hooks/fighter_bank_hooks.c). */
+    fighter_banks_funccall_before(text, sizeof text);
     /* Online.Tick() comes every frame from the patched main menu (scripts/apt-patch.py). */
     /* the menu-list calls repeat a dozen times a screen; 4000 in all ran out early in a long online
      * session, and the end of a session is where a report needs them */
@@ -1929,6 +2041,7 @@ static void funccall_hook(void)
     if (!ffny_online_locked())
         cheats_on_funccall(text);          /* Story tracking and Story cheats, src/patches/cheats.c; never online */
     sub_00068BA0();
+    fighter_banks_funccall_after(text);    /* the loading/versus/result screens name a bound bank's fighter */
     new_fighters_after_funccall(text);     /* new fighters in cells of their own */
     options_audio_after_funccall(text);
     /* RECOMP_FE_INJECT: commands of a test's own, after a chosen call (src/hooks/fe_inject.c). */
@@ -1961,7 +2074,13 @@ static void first_time_help_hook(void)
  * guest address of the result string, or 0. */
 unsigned int defjam_fe_call(const char *command)
 {
-    uint32_t sp0 = g_esp, n = (uint32_t)strlen(command) + 1, s, i;
+    char bound[192];
+    uint32_t sp0 = g_esp, n, s, i;
+    if (fighter_banks_before_call(command, bound, sizeof bound)) {
+        fprintf(stderr, "[BANKS] host call %s runs as %s\n", command, bound);
+        command = bound;
+    }
+    n = (uint32_t)strlen(command) + 1;
     s = (sp0 - 0x40u - n) & ~3u;
     for (i = 0; i < n; i++)
         MEM8(s + i) = (uint8_t)command[i];
@@ -2200,6 +2319,10 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         return first_time_help_hook;
     if (xbox_va == 0x000480E0u)         /* Game.GetNextFighter: new fighters in cells of their own (new_fighters.c) */
         return new_fighters_get_next;
+    if (xbox_va == 0x00054420u)         /* Unlock.GetCharacterList: stock fighters only (new_fighters.c) */
+        return new_fighters_unlock_list;
+    if (xbox_va == 0x000546B0u)         /* Unlock.GetGlobalCharUnlockInfo: the same count */
+        return new_fighters_unlock_info;
     if (xbox_va == 0x00081170u)         /* the crowd's update: its own generator copy online */
         return netplay_crowd_update;
     if (xbox_va == 0x0011EC80u)         /* the mixer's stream packet callback: released chunks */

@@ -175,16 +175,23 @@ def venues(blob):
     return out
 
 
+def set_venue_modes(blob, fe_id, modes):
+    """``djv2.sod`` with the Venue row of ``fe_id``'s match-type word set to ``modes``. Build 86: a Run the Streets map
+    gets 0, so Battle mode's venue select (``GetNextVenue``, which keeps the rows whose bit for the match type is set)
+    leaves it out; ``Game.StartGame`` still loads the row by its feID."""
+    for _, v in venues(blob):
+        if v["fe_id"] == fe_id:
+            return patch_u32(blob, v["offset"] + 4 * VENUE_MODES, modes)
+    raise KeyError("no Venue row with feID %d" % fe_id)
+
+
 def _row_name(base, above):
-    """``base`` or ``base`` + a suffix whose name hash is above ``above`` (rows are found by a sorted hash, and
-    a new row must sort last so the existing rows keep their index, which is their saved ID)."""
-    if name_hash(base) > above:
-        return base
-    for n in range(1, 1 << 20):
-        name = "%s %d" % (base, n)
-        if name_hash(name) > above:
-            return name
-    raise ValueError("no row name found")
+    """A name for a new row whose hash is just above ``above`` (rows are found by a sorted hash, and a new row must
+    sort last so the existing rows keep their index, which is their saved ID). Build 86: ``sodwrite.name_above``,
+    as for new fighters (fix/row-names): the first name above the floor, whatever its hash, used up the room above
+    the table after about 13 new venues ("no row name found")."""
+    from .sodwrite import name_above     # sodwrite imports this module
+    return name_above(base, above)
 
 
 def append_venue(blob, template_fe_id, fe_id, filename, display, name=""):

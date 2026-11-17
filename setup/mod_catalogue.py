@@ -26,7 +26,13 @@ def fields(value, expected, optional=''):
 # FFNY Online's own catalogue (play.defjam.online/updates/content, signed by the account service on
 # accept): every mod says its kind, type and install order; every version its content hash and the
 # pack signature. Optional here, so the upstream catalogue format stays valid.
-KINDS = ('content', 'replacement')
+KINDS = ('content', 'replacement', 'official-map')
+# Build 86: the FFNY team's OFFICIAL MAPS (index-v5.json only: launchers of build 85 read index-v4.json, which leaves
+# them out, and would refuse the kind and the keys). An official map is a venue pack every player gets, always on:
+# "kind": "official-map", "type": "venue", an id starting "official-", "venue_fe_id" (the front-end ID of the new
+# venue it adds, 28..63) and "rts_map": true for a Run the Streets map. Only the account service's admins publish one.
+OFFICIAL_PREFIX = 'official-'
+VENUE_FE_IDS = range(28, 64)
 TYPES = ('fighter-texture', 'fighter-body', 'fighter-model', 'clothing', 'venue', 'language', 'new-fighter')
 # a new fighter's front-end ID, given by the account service when the pack is submitted (index-v2.json only:
 # launchers up to build 78 read index.json, which leaves new fighters out, and would refuse the key and the type)
@@ -34,6 +40,19 @@ TYPES = ('fighter-texture', 'fighter-body', 'fighter-model', 'clothing', 'venue'
 # fighters at those places out, and would refuse them); setup/ffnycontent/newfighter.py PLACES has the same list.
 FIGHTER_FE_IDS = tuple(range(100, 128)) + (5, 15, 29, 37, 39, 42, 49, 53, 63, 66, 79, 86, 87, 88, 89, 90, 94, 95, 96,
                                            97)
+# Build 86: a community fighter beyond the places has a FIGHTER NUMBER instead, 1000 and up, given once by the
+# account service and never reused (index-v5.json only: launchers of build 85 and older read index-v4.json, which
+# leaves numbered fighters out, and would refuse the whole index for one). 999999 is the select grid's MORE cell.
+FIRST_FIGHTER_NUMBER = 1000
+LAST_FIGHTER_NUMBER = 0x7FFFFFFF
+MORE_CELL = 999999
+
+
+def fighter_number(value):
+    """Whether ``value`` is a community fighter's number (a numbered new fighter's ``fighter_fe_id``)."""
+    return type(value) is int and FIRST_FIGHTER_NUMBER <= value <= LAST_FIGHTER_NUMBER and value != MORE_CELL
+
+
 # a new fighter the team accepted as a SKIN (an extra outfit of a stock fighter, same gameplay, new look) has no
 # place: "fighter_mode": "skin" and "skin_of": the template's front-end ID (index-v4.json only: launchers of build
 # 84 and older read index-v3.json, which leaves skins out, and would refuse a new fighter without a place)
@@ -57,7 +76,13 @@ def ffny_mod(mod):
                 and 'fighter_fe_id' not in mod, 'Invalid skin')
     elif mod.get('type') == 'new-fighter' or 'fighter_fe_id' in mod:
         require(mod.get('type') == 'new-fighter' and type(mod.get('fighter_fe_id')) is int
-                and mod['fighter_fe_id'] in FIGHTER_FE_IDS, 'Invalid new fighter place')
+                and (mod['fighter_fe_id'] in FIGHTER_FE_IDS or fighter_number(mod['fighter_fe_id'])),
+                'Invalid new fighter place')
+    if mod.get('kind') == 'official-map' or 'rts_map' in mod or 'venue_fe_id' in mod:
+        require(mod.get('kind') == 'official-map' and mod.get('type') == 'venue'
+                and isinstance(mod.get('id'), str) and mod['id'].startswith(OFFICIAL_PREFIX)
+                and type(mod.get('venue_fe_id')) is int and mod['venue_fe_id'] in VENUE_FE_IDS
+                and type(mod.get('rts_map', False)) is bool and 'bundle' not in mod, 'Invalid official map')
     if 'language' in mod:
         require(isinstance(mod['language'], str) and re.fullmatch(r'[a-z]{2,3}(-[A-Za-z0-9]{2,8})?', mod['language']),
                 'Invalid language code')
@@ -122,7 +147,7 @@ def positive(value):
 
 def validate_mod(mod):
     fields(mod, 'id name description authors class licence homepage versions revoked_versions',
-           'kind type order language fighter_fe_id fighter_mode skin_of bundle bundle_name')
+           'kind type order language fighter_fe_id fighter_mode skin_of bundle bundle_name rts_map venue_fe_id')
     ffny_mod(mod)
     slug(mod['id'])
     for key in ('name', 'description', 'licence'):
@@ -194,6 +219,8 @@ def build(rows, revision, issued, expires):
     require(len(rows) == len({row['id'] for row in rows}), 'Duplicate mod ID')
     places = [row['fighter_fe_id'] for row in rows if 'fighter_fe_id' in row]
     require(len(places) == len(set(places)), 'Duplicate new fighter place')
+    venues = [row['venue_fe_id'] for row in rows if 'venue_fe_id' in row]
+    require(len(venues) == len(set(venues)), 'Duplicate official map venue')
     index = dict(schema=1, game='defjam-ffny-recomp', revision=revision, issued=issued,
                  expires=expires, mods=sorted(rows, key=lambda row: row['id']))
     return (json.dumps(index, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
