@@ -14,7 +14,7 @@ repository (`docs/content-catalogue.md` there); Studio's side is in the Studio r
 | `setup/mod_catalogue.py` | The catalogue contract, with FFNY's optional fields: `kind` (`content` / `replacement`), `type`, `order`, `language`, `fighter_fe_id`, `bundle` with `bundle_name` (always together); per version `content_sha256`, `pack_signature`. |
 | `setup/mods.py compose`, `setup/content_compose.py` | Composed packs (below): rebuilds the patched game files from the player's dump and each pack's deltas and ops. Runs at the end of every `sync`, as `mods.py compose` (the Content page's switch starts it), and is skipped when the packs, the switches and the bases are unchanged. `setup/ffnycontent/` is the part of FFNY Studio's library it needs (deltas, BIG archives, `djv2.sod`, `.loc`, the parts list, clothing ops, new venues). |
 | `src/hooks/pc_content.c` | Reads `content.ini` and the player's switches (`settings.ini [content] off`). At game start the synced texture packs go beneath the player's own packs in `RECOMP_TEXTURE_PACKS`, and the composed files are served through the game-file redirect (ahead of `<data>/override`; the language and song redirects chain to it; `[CONTENT] n composed file(s) served` in the log). The online **content print** (FNV-1a over id, version and content hash of every `content` pack, in order) is mixed into the build fingerprint and sent after the build number in HELLO, so rooms only match PCs with the same `content` set; a composed `content` pack counts only when `files.ini` lists it as applied. Replacements and language packs never count. |
-| Launcher | Syncs at its start and with each update check (`pc_launcher_content.inc`); PLAY during a sync cancels the download and waits for it to stop. The **Content** button opens the page: installed packs in catalogue order, `content` packs marked ALWAYS ON, a switch for each `replacement`. Settings > General > Game language lists English, French and every language pack that is on. |
+| Launcher | Syncs at its start and with each update check (`pc_launcher_content.inc`); PLAY during a sync cancels the download and waits for it to stop. The **Content** button opens the page: installed packs in catalogue order, `content` packs marked ALWAYS ON (ONLINE ONLY while "Community content in offline play" is off, build 90), a switch for each `replacement`. Settings > General > Game language lists English, French and every language pack that is on. |
 | Community tab | The Content page's second tab (`pc_launcher_community.inc`): every submitted pack from the account service's gallery (`GET /api/gallery`, sorted by votes or newest), also packs in review and rejected ones with the reason; the selected pack's page with its preview, description and changelog; Vote / Voted for signed-in players (one vote per account and pack). View only: nothing is downloaded from here. FFNY Studio's Community view reads the same endpoints. `RECOMP_CONTENT_TAB=community` opens it (screenshots). |
 | FFNY Studio button | The home screen's **FFNY STUDIO** card between the logo and PLAY (`pc_launcher_studio.inc`, `studio_app.cpp`, `studio_unzip.cpp`; Windows only). **Closed test (2026-11-10):** Studio goes to testers first, by the Discord role `FFNY Studio Beta` on the FFNY Online server (the server's owner and the pack admins always have access; server repository `docs/studio-closed-test.md`). At the launcher's start, whenever the player signs in or out, on hover (at most every two minutes) and every ten minutes while the answer is no, it asks the account service `GET /api/studio/access` with the player's session. The card is hidden when nobody is signed in or the account has no access (an installed Studio stays reachable while the service does not answer; Studio checks the access itself). With access it reads `GET /api/studio/latest` (`{"manifest": the signed text, "signature"}`) and believes the manifest only with a valid signature by the update key (`update_sig.h`, as `latest.json`); the card then shows once such a manifest exists or Studio is installed. The public folder (`studio/studio-latest.json` and its `.sig` on the update port, `https://play.defjam.online/updates/studio/`) is no longer read, except behind the test switches below. Its button: **Get FFNY Studio (<size>)**, the download's progress, **Open FFNY Studio**, or **Update Studio** when the published `build` is newer; a failure is one line in the card. The zip is `GET /api/studio/download/<setup>` with the session (`account_download` in `account.c`; on the public test path the manifest's `setup` beside the manifest, an absolute `url` only on the same host), resumed with a Range request, checked against `size` and `sha256`, unpacked (deflate, CRC-checked, only names under `FFNYStudio/`) into `<studio>\versions\<version>\`, then `<studio>\current.txt` is switched; the previous version stays, older ones go. `<studio>` = `RECOMP_STUDIO_DIR`, else `studio` beside the data folder (`%LOCALAPPDATA%\DefJamRecompiled\studio`). Open starts `FFNYStudio.exe --install-dir <install> --data-root <data> --account-file <data>\account.dat` in the exe's folder (`--install-dir` only for an installed copy). Tests: `RECOMP_STUDIO_SERVER=127.0.0.1:<port>` (the public path on a local server: plain HTTP, `/studio/...`, no access check), `RECOMP_STUDIO_PUBLIC=1` (the public path on the update servers), `RECOMP_STUDIO_TEST_KEY=<128 hex>` (only with that local server, or with `RECOMP_ACCOUNT_SERVER` on this PC for the account path), `RECOMP_TEST_STUDIO=<frame>:press;...`, `RECOMP_STUDIO_BUTTON=1` (show the card without access or a manifest); `scripts/test-studio-launcher.py` runs both paths: the public one, then the closed test against a local account service with a fake Discord API (signed out, refused, allowed, install with a resumed download, a wrong signature). |
 | `RECOMP_OFFLINE_ONLY=1` | Studio's Test in a fight: every online start is refused ("Online is off in this test session"). |
@@ -238,6 +238,44 @@ game build.
 - **Original fighters only / STANDARD ONLY.** An official map is a venue, never a fighter or a skin, so it never
   makes a pick "community". Its venue is a new venue, which STANDARD ONLY rooms leave out of their vote, and that is
   wanted: it is a Run the Streets map, loaded by that mode whatever the room's setting.
+
+## Community content in offline play (build 90)
+
+`settings.ini [content] community_offline` (default 1; the launcher's Content page and Basics, env
+`RECOMP_CONTENT_OFFLINE`) lets a player keep their own offline mods away from the always-on community packs.
+
+- **Off:** the game starts with the original data plus the player's own packs and the language packs. The synced
+  community packs (fighters, clothing, venues, skins, official maps, retextures) are not mounted: `pc_content_list`
+  leaves them out, the composed files come from `<data>/mod-manager/own-packs/content-files` (`mods.py compose` builds
+  that composition of the player's own packs alone next to `content-files`), and offline Battle and Story show the
+  standard roster and venues. Nothing is deleted or re-downloaded; the sync keeps running, so turning it on needs
+  nothing. Run the Streets needs its official map, so it is not offered offline while the content is off.
+- **Online needs it on.** With the setting off the game never connects (`netplay.c start()` refuses). ONLINE on the main
+  menu opens the prompt "Online needs FFNY Online's community content. Restart with it now?": YES closes the game
+  and the launcher in UPDATE NOW mode syncs, composes and starts it again with `--content-update`, which has the content
+  on for that run only (the saved setting stays off) and opens the online hub; NO goes back.
+- The log's `[CONTENT] community content in offline play:` line and F9's `[REPORT] community content in offline play:`
+  line say which. Tests: `tests/unit/test_content_offline.py`.
+
+## Credits (build 94)
+
+A community pack may use somebody else's work (a skin texture, a model, a voice). The creator names the original makers
+in the **Credits** field of FFNY Studio's submit step (one credit per line, at most 300 characters and 6 lines, no
+links); the submit rules say that such work needs the maker's permission and a name in Credits.
+
+- **Where they live.** Not in the package: not in `pack.json`, not in `content_sha256` or the pack signature, not in the
+  installable zip. So they never change what online matching compares (`pc_content_print` hashes id, version and content
+  hash only), and the team can add or fix them without a new version (the review post's Edit credits button, or the
+  creator's Save credits in Studio while the pack waits).
+- **Catalogue.** `index-v6.json` is `index-v5.json` plus the mod key `credits` (`mod_catalogue.credits`). Launchers of
+  build 93 and older validate mod keys strictly and keep reading `index-v5.json`; build 94 reads v6 and falls back
+  v6 -> v5 -> v4 -> v3 on a 404 (`mods.FALLBACK`).
+- **Launcher.** `setup/mods.py` writes `credits=` (one line, ` | ` between credits) into each `[pack.<id>]` of
+  `content.ini` from the verified catalogue at every sync, so a credits edit shows without installing the pack again
+  (a credits-only revision is no news and no download). The Content page shows "Credits: ..." under a pack's card (a
+  single pack and a pack of several mods); the Community tab shows them on the pack's page (`credits` of
+  `GET /api/gallery/{id}`). The game's own screens do not name creators.
+- Tests: `tests/unit/test_content_credits.py`; the server side is in `docs/content-catalogue.md` "Credits".
 
 ## Testing
 

@@ -49,7 +49,7 @@ from ffnycontent import clothing, cpparts, delta, fighterart, loc, newfighter, n
 from ffnycontent import sod as sodmod
 
 SCHEMA = 1
-COMPOSER = 10                   # bump when the output for the same inputs changes (10: build 86 = banks, official maps, fighter_light)
+COMPOSER = 11                   # bump when the output for the same inputs changes (10: build 86 = banks, official maps, fighter_light; 11: own voices of fighters beyond the places)
 NEW_DAYS = 14                   # a new fighter's select thumbs carry NEW for this long after its review
 HUB_ART = ('online-art', 'fighters')    # <data>/online-art/fighters/<feID>.png: the online hub's portraits
 SKIN_ART = ('online-art', 'skins')      # <data>/online-art/skins/<pack id>.png: a skin's picture in the skin window
@@ -165,6 +165,16 @@ def read_off(data):
             if key.strip().lower() == 'off':
                 off = {p.strip() for p in value.split(',') if p.strip()}
     return off
+
+
+def read_own_off(data):
+    """Build 94: the player's own packs that are switched off: <data>/mod-manager/own-off.txt, one pack id per line
+    (the launcher's Content page writes it; a setting holds only 1023 characters, which is about 60 pack ids)."""
+    try:
+        text = (Path(data) / 'mod-manager' / 'own-off.txt').read_text(encoding='utf-8-sig', errors='replace')
+    except OSError:
+        return set()
+    return {line.strip() for line in text.splitlines() if line.strip()}
 
 
 _langpack_module = None
@@ -764,6 +774,15 @@ def finish_logical(work, applied, skipped, log):
             if name.lower() not in there:
                 work.add(newfighter.SCREENS_ARCHIVE, name, data)
                 there.add(name.lower())
+    # own voices: the banks' voice entries, which the game points at the bound fighter's files (unlimited.py)
+    speech = newfighter.fightervoice.SPEECH_ARCHIVE
+    names = files.names(speech) if work.exists(speech) else []
+    voiced = [r['id'] for r in work.logical if unlimited.has_logical_voice(names, r['id'])]
+    if voiced:
+        for name, data in unlimited.bank_voice_placeholders(lambda e: work.current(speech, e), lambda: names):
+            work.add(speech, name, data)
+        log('[compose] own voices of %d community fighters beyond the places: %s' %
+            (len(voiced), ', '.join(map(str, voiced))))
     log('[compose] %d community fighters beyond the places (banks 124..127)' % len(work.logical))
 
 
@@ -998,7 +1017,7 @@ def unchanged(root, state, key, data, game):
             and all((out / LANG_DIR / i).joinpath(*PurePosixPath(f).parts).is_file() for i, f in files['lang']))
 
 
-def compose(data, game, packs, off=None, root=None, log=print, languages=None, today=None, reserved=()):
+def compose(data, game, packs, off=None, root=None, log=print, languages=None, today=None, reserved=(), portraits=True):
     """Compose ``packs`` ([{id, version, content_sha256, kind, order, folder, fighter_fe_id, reviewed, bundle,
     bundle_name}], every synced pack with an install.json; ``fighter_fe_id`` the catalogue's place of a new
     fighter, ``reviewed`` the catalogue's review date of the version (``new_packs``; ``today``: the UTC date it
@@ -1027,10 +1046,11 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None, t
     if unchanged(root, state, key, data, game):
         ids = set(state['applied'])
         screens = Bases(data, game)
-        hub_portraits(data, [p for p in chosen if p['id'] in ids],
-                      lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), state.get('hub', []))
-        skin_portraits(data, [p for p in chosen if p['id'] in ids],
-                       lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), missing_only=True)
+        if portraits:
+            hub_portraits(data, [p for p in chosen if p['id'] in ids],
+                          lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), state.get('hub', []))
+            skin_portraits(data, [p for p in chosen if p['id'] in ids],
+                           lambda entry: screens.read(newfighter.SCREENS_ARCHIVE, entry), missing_only=True)
         return {'applied': state['applied'], 'skipped': [tuple(s) for s in state.get('skipped', [])],
                 'files': state.get('files', []), 'lang_files': [tuple(x) for x in state.get('lang_files', [])],
                 'lang_skipped': [tuple(s) for s in state.get('lang_skipped', [])], 'unchanged': True}
@@ -1060,8 +1080,12 @@ def compose(data, game, packs, off=None, root=None, log=print, languages=None, t
         swap(root, new)
     else:
         remove_output(root)
-    hub = hub_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
-    skin_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
+    # portraits=False: a second composition into another root (mods.py compose_own, the player's own packs alone)
+    # shares <data>/online-art with the full one, so it must leave the full one's pictures alone
+    hub = []
+    if portraits:
+        hub = hub_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
+        skin_portraits(data, applied, lambda entry: work.current(newfighter.SCREENS_ARCHIVE, entry))
     state = {'schema': SCHEMA, 'key': key, 'bases': bases.seen, 'applied': [p['id'] for p in applied],
              'skipped': skipped, 'files': files, 'lang_files': lang_files, 'lang_skipped': lang_skipped, 'hub': hub,
              'set': set_hash(applied, switched) if applied else ''}

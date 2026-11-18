@@ -164,7 +164,7 @@ constexpr float W = 1100, H = 680;
 const wchar_t* DISCORD = L"https://discord.gg/ffnyonline";
 const wchar_t* DUMP_GUIDE = L"https://github.com/sweeax-exe/ffny-online/blob/main/docs/dump-your-disc.md";
 
-struct Answer { int token; DWORD code; std::string text; };
+struct Answer { int token; DWORD code; std::string text; std::string error; };
 
 // ---- Drawing ------------------------------------------------------------------------------------
 ID2D1Factory* d2d = nullptr;
@@ -901,8 +901,11 @@ void drawFailed() {
                              : st.exitCode == 3 && !st.prereq && !st.update ? L"\u2022 Setup can add the missing Windows parts: select Turn on and try again (Windows asks for permission)."
                              : st.exitCode == 3 ? L"\u2022 Install the parts named above, then select Try again."
                              : L"\u2022 Select Try again: setup continues where it stopped.";
-        y += text(first, item, x, y, w, cream(0.85f)) + 10;
-        rich({{L"\u2022 Still stuck? ", cream(0.85f)}, {L"Ask in our Discord", GOLD, L_DISCORD - 1000},
+        if (!blockedAdvice.empty() && st.exitCode == 4) {
+            for (const auto& line : blockedAdvice) y += text(line, item, x, y, w, cream(0.85f)) + 6;
+            y += 4;
+        } else y += text(first, item, x, y, w, cream(0.85f)) + 10;
+        if (blockedAdvice.empty() || st.exitCode != 4) rich({{L"\u2022 Still stuck? ", cream(0.85f)}, {L"Ask in our Discord", GOLD, L_DISCORD - 1000},
               {L" and attach the log file (Open log file).", cream(0.85f)}}, item, x, y, w);
     }
     float by = 544 - 44;
@@ -1086,7 +1089,7 @@ void ask(std::vector<std::wstring> args, UINT message, int token) {
                 readShared(out, answer->text);
                 std::error_code e; fs::remove(out, e);
             }
-        } catch (const std::exception& ex) { nativeLog(std::string("Setup question failed: ") + ex.what()); }
+        } catch (const std::exception& ex) { answer->error = ex.what(); nativeLog(std::string("Setup question failed: ") + ex.what()); }
         PostMessageW(window, message, 0, (LPARAM)answer);
     }).detach();
 }
@@ -1432,6 +1435,21 @@ void enableDarkFrame(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, 36 /* DWMWA_TEXT_COLOR */, &textColor, sizeof(textColor));
 }
 
+// The folder card when the helper gave no plan: its own words (it writes {"error": ...} next to a non-zero
+// exit), or why it could not start; the advice for a tool Windows blocked (4551) in place of the usual fix.
+Check planErrorCheck(const Answer& answer) {
+    std::wstring reason;
+    if (!answer.text.empty()) { auto j = parseJson(answer.text); reason = j["error"].str(); }
+    if (reason.empty() && !answer.error.empty()) reason = utf8(answer.error);
+    std::wstring fix = L"Choose another folder, or see the setup log.";
+    if (!blockedAdvice.empty()) {
+        fix.clear();
+        for (const auto& line : blockedAdvice) fix += (fix.empty() ? L"" : L" ") + line;
+    }
+    return {L"error", reason.empty() ? L"Setup couldn't check this folder (exit " + std::to_wstring(answer.code) + L")"
+                                     : L"Setup couldn't check this folder: " + reason, fix, false};
+}
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
         case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); paintWindow(); EndPaint(hwnd, &ps); return 0; }
@@ -1583,7 +1601,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                 for (const auto& c : j["checks"].items) p.checks.push_back({c["id"].str(), c["text"].str(), c["fix"].str(), c["ok"].yes()});
             } else {
                 p.valid = true; p.ok = false;
-                p.checks.push_back({L"error", L"Setup couldn't check this folder", L"Choose another folder, or see the setup log.", false});
+                p.checks.push_back(planErrorCheck(*answer));
             }
             st.plan = p;
             redraw();
@@ -1646,7 +1664,7 @@ Plan samplePlan(bool good) {
 }
 
 bool sampleState(const std::wstring& name) {
-    st = State{};
+    st = State{}; blockedAdvice.clear();
     st.payloadReady = true; st.searching = false;
     st.found = {sampleFound(true)};
     if (name == L"game" || name == L"main") { st.screen = S_GAME; return true; }
@@ -1677,6 +1695,21 @@ bool sampleState(const std::wstring& name) {
     if (name == L"folder") { st.screen = S_FOLDER; st.plan = samplePlan(true); return true; }
     if (name == L"folder-checking") { st.screen = S_FOLDER; st.planning = true; return true; }
     if (name == L"folder-problem") { st.screen = S_FOLDER; st.plan = samplePlan(false); return true; }
+    if (name == L"folder-error" || name == L"folder-blocked") {
+        // The helper gave no plan: a drive Windows cannot read (error 1450), or the helper itself blocked (4551).
+        Answer answer{0, 4, {}, {}};
+        if (name == L"folder-error")
+            answer.text = "{\"error\": \"Windows could not read this folder: [WinError 1450] Insufficient system resources "
+                          "exist to complete the requested service: 'E:\\\\Games\\\\FFNY Online'\"}";
+        else {
+            auto problem = describeToolStartFailure(4551, L"C:\\Users\\Player\\AppData\\Local\\DefJamSetup\\{5C1D7E0A}\\payload\\python\\python.exe");
+            answer.error = narrow(problem.message); blockedAdvice = problem.advice;
+        }
+        Plan p = samplePlan(true);
+        p.ok = false; p.checks.clear(); p.checks.push_back(planErrorCheck(answer));
+        st.screen = S_FOLDER; st.plan = p;
+        return true;
+    }
     if (name == L"installing" || name == L"installing-details" || name == L"cancel-confirm") {
         st.screen = S_INSTALLING; st.plan = samplePlan(true); st.permille = 460; st.stageKey = "build";
         st.statusText = L"Build in progress (this may take several minutes)";
@@ -1692,13 +1725,21 @@ bool sampleState(const std::wstring& name) {
         if (logPath.empty()) logPath = L"C:\\Users\\Player\\AppData\\Local\\DefJamSetup\\logs\\{5C1D7E0A-2B9F-4C51-9E7A-0D3F6B8A1C24}.log";
         return true;
     }
+    if (name == L"failed-blocked") {
+        // Smart App Control (4551): what the failure screen shows when Windows refuses a setup tool.
+        auto problem = describeToolStartFailure(4551, L"C:\\Users\\Player\\AppData\\Local\\DefJamSetup\\{5C1D7E0A}\\payload\\python\\python.exe");
+        st.screen = S_FAILED; st.plan = samplePlan(true); st.exitCode = 4; st.prereq = false;
+        st.failure = problem.message; blockedAdvice = problem.advice;
+        if (logPath.empty()) logPath = L"C:\\Users\\Player\\AppData\\Local\\DefJamSetup\\logs\\{5C1D7E0A-2B9F-4C51-9E7A-0D3F6B8A1C24}.log";
+        return true;
+    }
     if (name == L"wine") { st.screen = S_WINE; return true; }
     return false;
 }
 
 const wchar_t* SNAPSHOT_STATES[] = {L"game", L"game-searching", L"game-empty", L"game-several", L"checking", L"recognized",
     L"wrong-pal", L"wrong-pal-found", L"wrong-ps2", L"wrong-gamecube", L"wrong-generic", L"folder", L"folder-checking",
-    L"folder-problem", L"installing", L"installing-details", L"cancel-confirm", L"done", L"failed", L"cancelled", L"wine"};
+    L"folder-problem", L"folder-error", L"folder-blocked", L"installing", L"installing-details", L"cancel-confirm", L"done", L"failed", L"failed-blocked", L"cancelled", L"wine"};
 
 HWND createWindow(HINSTANCE instance, bool visible) {
     WNDCLASSW wc{}; wc.lpfnWndProc = windowProc; wc.hInstance = instance;

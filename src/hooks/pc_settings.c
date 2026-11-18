@@ -80,12 +80,12 @@ static RecompSetting g_display_settings[] = {
       "Capture source textures for making a pack, in hd-work/runtime under the data folder." },
     { "textures", "dump_limit", RECOMP_SETTING_INT, 2000, 0, 65536, NULL, "RECOMP_TEXTURE_DUMP_LIMIT", RECOMP_SETTING_RESTART,
       "Maximum new source images captured in one run." },
-    { "online", "server", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_NETPLAY_SERVER", 0,
-      "The server for online play: auto (the one with the lowest ping of Europe, US East and Singapore), eu, na "
-      "(US East), sg (Asia (Singapore)), all (the rooms of every server; the hub connects to the lowest ping and moves "
-      "to join; \"both\" of older builds means all), or a relay's own address as host or host:port (port 27777 "
-      "if left out). Quick Match widens to the other servers when nobody is waiting. Accounts and stats stay on "
-      "Europe.", "auto" },
+    /* build 91 (owner): players never pick a server. The hub connects to the relay with the lowest ping and every
+     * room, quick match and ranked search is one pool across the relays. This is a hidden test/debug override
+     * (never shown in the launcher or the game; a [online] server of builds before 91 is not read any more). */
+    { "online", "server_debug", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_NETPLAY_SERVER", 0,
+      "Tests and debugging only: auto (the server with the lowest ping, the default), or a server's own address as "
+      "host or host:port (port 27777 if left out).", "auto" },
     { "online", "name", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
       "Your name, shown to the other player.", "Player" },
     { "online", "fighter", RECOMP_SETTING_INT, 55, 0, 255, NULL, NULL, 0,
@@ -93,6 +93,9 @@ static RecompSetting g_display_settings[] = {
     { "online", "fighter_skin", RECOMP_SETTING_INT, 0, 0, 15, NULL, NULL, 0,
       "The community skin of that fighter you play online (0 its own look, 1.. its skins in the catalogue's order; "
       "build 85); chosen in the room's CHOOSE A LOOK window." },
+    { "online", "fighter_tab", RECOMP_SETTING_INT, 0, 0, 2, NULL, NULL, 0,
+      "The tab CHOOSE FIGHTER opens on: 0 FFNY (the game's fighters), 1 Community, 2 Created (your Story-mode "
+      "fighters); the last one you chose (build 90). LT/RT switch tabs." },
     { "online", "created", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
       "Which of your Story-mode fighters you play online when you pick a created fighter: its save, as "
       "user ID folder/name; chosen in the room. Empty: the newest.", "" },
@@ -135,6 +138,11 @@ static RecompSetting g_display_settings[] = {
       "Let quick match, rooms and King of the Hill pair you with players of the community Android port "
       "(by contatg) in builds that FFNY Online has tested for cross-play. Off: you only meet PC players. "
       "Ranked never mixes platforms. Takes effect the next time you go online." },
+    { "online", "p2p_direct", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, "RECOMP_P2P_DIRECT", 0,
+      "Direct connection (P2P) in 1v1 online fights, used only when the other player has it on too: the fight's "
+      "inputs also go straight between the two PCs, which can be faster than through the server. The other player's "
+      "game then gets your IP address (and you theirs), which someone could use to attack your connection (DDoS). "
+      "Off by default. If the direct path fails, the fight goes on through the server. Applies from the next match." },
     { "online", "original_fighters", RECOMP_SETTING_INT, 0, 0, 536870911, NULL, NULL, 0,
       "Kept by the game: where you chose \"Original fighters only\" instead of \"All fighters (community too)\" "
       "when you start a search (Quick Match per match type, King of the Hill, FFA rotation, Ranked), so the same "
@@ -263,6 +271,9 @@ static RecompSetting g_display_settings[] = {
       "Run the Streets: the minimap in the top right (the streets' walls, every fighter, up is where the camera looks)." },
     { "openworld", "minimap_range", RECOMP_SETTING_INT, 70, 30, 150, NULL, "RECOMP_OW_MINIMAP_RANGE", 0,
       "Run the Streets: how far the minimap reaches, in metres from your fighter to its edge." },
+    { "openworld", "combat_pings", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_OW_COMBAT_PINGS", 0,
+      "Run the Streets: a fighter who hits, is hit or grabs shows as a red dot on the minimap for about 3 seconds "
+      "(on the rim as an arrow when far away), so you can see where the fighting is." },
     { "openworld", "free_roam", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_OW_FREE_ROAM", 0,
       "Run the Streets / Big Arena: out of combat your fighter walks freely and faces where it goes; a fight button "
       "next to someone, a hit, or White/Black (or a right-stick flick) to lock on brings the fight stance back. "
@@ -288,6 +299,13 @@ static RecompSetting g_display_settings[] = {
     { "music", "new_song_per_match", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_MUSIC_NEW_SONG_PER_MATCH", 0,
       "Each new fight (a rematch, the next match, the next fight of a rotation) starts the next of your songs; "
       "off keeps the song playing on from where it was." },
+    { "audio", "next_song_key", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+      "The key that skips to the next song, in the menus and in fights (offline and online; only your PC hears "
+      "it): a letter or digit, F1-F12, Tab, CapsLock, LAlt, Mouse4 or Mouse5. Empty for none.", "M" },
+    { "audio", "next_song_pad", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+      "Controller buttons that skip to the next song, pressed together (it acts when the last one goes down), "
+      "e.g. back+right_shoulder; alternatives separated by commas, button names as in [gamepad]. The game sees "
+      "the presses too. Empty (the default) for none.", "" },
     { "graphics", "enabled", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
       "Enhanced graphics (community): the ReShade / DLSS pack with presets by Marleymarletto, installed by the "
       "launcher next to the game (Launcher > Graphics). Heavy on the GPU: for NVIDIA RTX cards." },
@@ -299,8 +317,8 @@ static RecompSetting g_display_settings[] = {
 
 /* The display table followed by the input tables (pc_input.c): one array, one
  * registration, one file. */
-/* + [language]/[content] (5) and [cheats] (5). */
-static RecompSetting g_settings[DISPLAY_SETTING_COUNT + 64 + 16 + 16 + 5 + 8];
+/* + [language]/[content] (7) and [cheats] (5). */
+static RecompSetting g_settings[DISPLAY_SETTING_COUNT + 64 + 16 + 16 + 7 + 8];
 static size_t g_setting_count;
 
 static char g_path[MAX_PATH * 4];   /* empty: do not load or save */
@@ -735,7 +753,8 @@ static int local_address(const char *v)
 static int may_run_beside_another(void)
 {
     static const char *const vars[] = { "RECOMP_NETPLAY_SERVER_EU", "RECOMP_NETPLAY_SERVER_NA",
-                                        "RECOMP_NETPLAY_SERVER_SG", "RECOMP_ACCOUNT_SERVER" };
+                                        "RECOMP_NETPLAY_SERVER_SG", "RECOMP_NETPLAY_SERVER_SA", "RECOMP_NETPLAY_SERVER_MIA",
+                                        "RECOMP_NETPLAY_SERVER_DFW", "RECOMP_NETPLAY_SERVER_LAX", "RECOMP_ACCOUNT_SERVER" };
     const char *settings = getenv("RECOMP_SETTINGS"), *one = getenv("RECOMP_NETPLAY_SERVER");
     int i, test_run = (settings && !_stricmp(settings, "none")) ||
                       (getenv("RECOMP_PAD_SCRIPT") && !getenv("RECOMP_PAD_HOST"));
@@ -883,6 +902,8 @@ int pc_settings_start_content_update(void)
  * "Skip the launcher" made it work (2026-10-21). Waiting keeps DefJamLauncher's play.lock held
  * for the game's whole life, as before. Returns only when the process could not be started (the
  * game then starts here, as it used to). */
+void cloud_saves_after_game(void);     /* pc_launcher_cloud.cpp: the saves go up when they changed */
+
 static void start_game_process(int reopen_launcher)
 {
     static WCHAR exe[32768];
@@ -921,6 +942,8 @@ static void start_game_process(int reopen_launcher)
         WaitForSingleObject(pi.hProcess, INFINITE);
         graphics_mod_settled();
         GetExitCodeProcess(pi.hProcess, &code);
+        /* build 91: no launcher opens after the game, so its saves go up from here (pc_launcher_cloud.h) */
+        if (!cu_after_child_exit(code)) cloud_saves_after_game();
         /* build 86: the game closed for UPDATE NOW: the launcher, in update mode, gets the content */
         if (cu_after_child_exit(code) && pc_settings_start_content_update()) ExitProcess(0);
         ExitProcess(code);
@@ -1138,23 +1161,15 @@ int pc_settings_init(void)
         pc_input_settings(g_settings + DISPLAY_SETTING_COUNT, 64);
     g_setting_count += pc_ui_settings(g_settings + g_setting_count, 16);
     g_setting_count += pc_debug_settings(g_settings + g_setting_count, 16);
-    g_setting_count += pc_language_settings(g_settings + g_setting_count, 5);
+    g_setting_count += pc_language_settings(g_settings + g_setting_count, 7);
     /* [cheats] was registered by the app only (pc_settings_catalog.c), so in the game every cheat read its
      * default and the cheats did nothing (build 82). tests/unit/test_settings_registered.py */
     g_setting_count += cheats_settings(g_settings + g_setting_count, 8);
     recomp_settings_register(g_settings, g_setting_count);
     recomp_settings_set_log(settings_log);
     read = g_path[0] ? recomp_settings_load(g_path) : 0;
-    {   /* The first server was known by its address; installs that saved it move to the name. */
-        char server[128];
-        recomp_settings_get_text("online", "server", server, sizeof(server), "");
-        /* Build 30: the old default, the Europe relay's name, becomes "auto" (the nearest relay); a
-         * player who wants Europe only picks it again in the hub or the launcher. */
-        if ((!strcmp(server, "142.132.178.17") || !_stricmp(server, "play.defjam.online") ||
-             !_stricmp(server, "play.defjam.online:27777")) && !getenv("RECOMP_NETPLAY_SERVER") &&
-            recomp_settings_reset_to_default("online", "server") > 0 && g_path[0])
-            recomp_settings_save(g_path);
-    }
+    /* Build 91: the server choice is gone ([online] server of older builds is not read; server_debug is the hidden
+     * test override), so the migration of build 30's saved address went with it. */
     /* "Skip the launcher at start" left the players' menus (2026-10-22): players who had ticked it
      * kept asking how to get the launcher back. A player's own settings.ini that still has it is
      * set back once; a settings file a test names (RECOMP_SETTINGS) keeps it. */

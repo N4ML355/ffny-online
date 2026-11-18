@@ -531,6 +531,35 @@ that relay.
   quick room once its quick match searches other relays (build 38: any choice but a custom address; the
   `age` lets two such players decide who moves; see `docs/netplay.md`).
 
+### Pings to every relay (build 91, CAPS bit 28)
+
+The relays form one table, in the same order in the game (`src/hooks/netplay_servers_rules.c`) and the relay
+(`relay/relays.go` `RelayNames`): eu, na, sg, sa, mia. It only grows at its end. QUICK's pings (CAPS bit 26), the long
+RANKED's pings and ROOMLIST's listed pings carry the first three in their fixed fields. To a relay that answered
+CAPS bit 28 the game adds a trailer to QUICK (after the three pings) and to the long RANKED (after the code): a
+count byte E, then E u16 LE pings to the relays from the fourth on. A ROOMLIST request with bits 16, 26 and 28
+gets, after the listed pings, the count once and E u16 pings per listed room. A side reads at most 8 relays and
+keeps those it knows. The relay tells the matchmaker which relays each queued game knows, so a ranked set never
+moves a build before 91 to a relay it does not know (South America, Miami); those relays run with `-min-build 91`.
+
+### The global quick-match pool (build 91)
+
+Players never pick a relay. The hub connects to the one with the lowest ping; the room list and the players
+list show every relay's. A quick match reads every relay's ROOMLIST (with the listed pings, so every relay needs
+`relay-by-ping-sum` or `-ping-sum`) and pairs the one-player quick rooms of the same fighter choice
+(`netservers_pool`, `src/hooks/netplay_servers_rules.c`): smallest ping sum first, on the relay with the smallest
+sum whose worse ping is within the limit of the longer wait (120 ms; 180 from 10 s; 250 from 20 s; any from 40 s).
+Both players go to that relay and QUICK there. Ranked play is one pool already (the account service's matchmaker).
+
+Build 94: a game moves only on an answer the other game reaches too (`netservers_pool_steady`): the same pair and
+relay with every wait 3 s shorter and longer. Each game reads the other's room age from another relay's list, a
+second or two apart; near a limit step one could pick its own relay while the other, one limit further, picked the
+first one's, and both moved and swapped. Inside the slack both wait for the next list. Two quick rooms on one
+relay are always the relay's to join (QUICK), never the pool's; the relay keeps rooms of another build print apart,
+and logs `quick: ... have another build print (kept apart)` when that hits games of one build number and content
+print (build 93's two-copy test: the build print hashed a content list another thread was rewriting at start-up;
+`pc_content_print` now lists into its own buffer, and the game logs `[NETPLAY] build print ...` per session).
+
 ## Who is online without a session (all servers)
 
 Since build 47 the PLAYERS ONLINE page lists every relay's players when the player chose **All
@@ -630,6 +659,22 @@ refuses a second live hub session from one PC, for builds that skip that.
   fingerprint that has sent nothing for 5 s (a crashed game, a lost `BYE`) is replaced instead. The
   relay logs who and where (names, anonymised ids, builds), no verdict.
 - Sessions that never send `PC` (builds before 46, local test copies) are never refused.
+
+## Direct connection (P2P, build 90)
+
+Opt-in, CAPS bit 27 (`1 << 27`) both ways: the client can do it; the relay's switch (`p2p-allowed` in its
+updates folder) is on. The relay keeps forwarding every DATA; it only exchanges endpoints.
+
+| Message | Direction | Body |
+|---|---|---|
+| `P2P` 0x3A | client -> server | token 8, u32 START seed, 16 zero bytes (34 bytes in all, so the answer is never larger) |
+| `P2P` 0x3A | server -> client | u32 seed, u8 status: 0 NO, 1 OK, 2 WAIT; with OK: u8 the other player's room slot, 4 bytes IPv4, u16 port, 8 bytes match key |
+| `DIRECT` 0x3B | game <-> game | the match key 8, u8 kind (1 PROBE: u32 seq, u32 clock ms; 2 ACK: the probe's 8 bytes; 3 DATA: a `P_STEPS` or `P_LIVEPAD` payload) |
+
+A game sends `P2P` only after a START of exactly two players, only while its player has `[online] p2p_direct`
+on. OK comes only when both players of that START asked for the same seed; until then WAIT. NO: switch off,
+not 1v1, a spectator, another seed, the other game lacks bit 27, an address that is not IPv4. `DIRECT` never
+reaches the relay. Design and fallback: `docs/research/p2p-optin.md`.
 
 ## Server operation
 

@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <vector>
 #include <map>
@@ -41,6 +42,7 @@
 #include "pc_ui_actions.h"
 #include "pc_launcher_home.h"
 #include "pc_content.h"
+#include "mods_master_logic.h"
 #include "content_update.h"
 #include "content_release.h"
 
@@ -76,6 +78,7 @@ extern "C" {
 #include "rts_social_rules.h"
 #include "hd_build.h"
 #include "updater.h"
+#include "next_song.h"
 
 #ifndef DEFJAM_VERSION
 #define DEFJAM_VERSION "dev"
@@ -247,20 +250,23 @@ static const char *friendly(const char *section, const char *key)
         {"gamepad", "left_stick", "Left stick comes from"},
         {"gamepad", "right_stick", "Right stick comes from"},
         {"launcher", "skip", "Skip the launcher at start"},
+        {"content", "community_offline", "Community content in offline play"},
         {"ui", "scale", "Text and control size"},
         {"debug", "unlock_all", "Unlock all fighters and venues"},
         {"debug", "skip_intro", "Skip startup movies and legal screen"},
         {"ui", "overlay_pad", "Overlay pad buttons"},
         {"ui", "overlay_key", "Overlay key"},
         {"ui", "button_icons", "Button icons"},
-        {"online", "server", "Server"},
         {"online", "name", "Your name"},
         {"online", "input_delay", "Input delay (steps)"},
         {"online", "rollback", "Rollback netcode (beta)"},
         {"online", "crossplay_android", "Play with Android players"},
+        {"online", "p2p_direct", "Direct connection (P2P) in 1v1 fights"},
         {"gameplay", "offline_countdown", "Start countdown in offline fights"},
         {"online", "voice", "Voice chat"},
         {"online", "voice_key", "Push-to-talk key"},
+        {"audio", "next_song_key", "Next song key"},
+        {"audio", "next_song_pad", "Next song on the controller"},
         {"online", "voice_pad", "Push-to-talk on the controller"},
         {"online", "voice_volume", "Voices volume (%)"},
         {"online", "voice_mic_volume", "Microphone volume (%)"},
@@ -892,6 +898,38 @@ static void crossplay_setting()
     settings_group("online", { "crossplay_android" });
     ImGui::TextDisabled("Off by default. When on, you can be matched with players of the Android port once a "
                         "build is cleared for cross-play. Ranked never mixes platforms.");
+}
+
+// Build 90: the direct connection (P2P, docs/research/p2p-optin.md), the player's own opt-in, off by default.
+// Turning it on shows the IP notice first and needs "Turn on"; off is at once.
+static void p2p_setting()
+{
+    RecompSetting *s = find("online", "p2p_direct");
+    if (!s) return;
+    static bool ask;
+    bool locked = s->source == RECOMP_SETTING_FROM_ENV, v = (locked ? s->value : s->stored) != 0;
+    if (locked) ImGui::BeginDisabled();
+    if (ImGui::Checkbox(friendly("online", "p2p_direct"), &v)) {
+        if (v) ask = true;
+        else recomp_settings_set("online", "p2p_direct", 0);
+    }
+    if (locked) ImGui::EndDisabled();
+    ImGui::TextDisabled("Off by default. Used only when the other player has it on too. The other player's game then "
+                        "sees your IP address.");
+    if (ask) ImGui::OpenPopup("Turn on the direct connection?");
+    if (ImGui::BeginPopupModal("Turn on the direct connection?", &ask, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30);
+        ImGui::TextUnformatted("A direct connection sends the fight's inputs straight between your PC and the other player's, which can be faster than through the server. The other player's game then gets your IP address (and you get theirs). Someone could use it to attack your internet connection (a DDoS), so only turn it on when you accept that. It is used only in 1v1 fights and only when the other player has it on too; if the direct path fails, the fight goes on through the server.");
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("Turn on")) {
+            recomp_settings_set("online", "p2p_direct", 1);
+            ask = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { ask = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
 }
 
 // ---- window size ----------------------------------------------------------------------------------------
@@ -1911,7 +1949,7 @@ static void page_online(UiMode mode)
     ImGui::SeparatorText("Account");
     page_account();
     ImGui::SeparatorText("Connection");
-    settings_group("online", { "server", "name" });
+    settings_group("online", { "name" });  // build 91: no server choice
     {
         char shown[32];
         if (account_game_name(shown, sizeof(shown)))
@@ -1921,6 +1959,7 @@ static void page_online(UiMode mode)
     discord_status_setting();
     settings_group("online", { "hill_watch", "name_tags", "perfect_banner", "delay_display" });
     crossplay_setting();
+    p2p_setting();
     ImGui::Spacing();
     ImGui::PushFont(g_font_bold, ImGui::GetStyle().FontSizeBase * 1.1f);
     ImGui::TextColored(k_gold, "Online play is in the game: choose ONLINE in the main menu.");
@@ -2778,7 +2817,7 @@ static void quality_widget()
                           "next time the game starts.");
 }
 
-// The online server (build 30; build 38: three relays): Automatic, Europe, US East or Asia, each with
+// The online server (build 30; build 91: the relay table): Automatic or one of the relays (Europe, US East, Asia, South America, Miami), each with
 // its ping and players as the relays answer (netplay_servers.c), or All servers. A custom address
 // (Advanced, Online) shows as such.
 static std::string server_line(const NetServerInfo &s)
@@ -2793,7 +2832,7 @@ static std::string server_line(const NetServerInfo &s)
     return line;
 }
 
-static void server_widget()
+[[maybe_unused]] static void server_widget()  // build 91: no longer shown (no server choice)
 {
     netservers_probe();
     NetServerInfo s[NETSERVER_COUNT];
@@ -2808,7 +2847,7 @@ static void server_widget()
     char buf[128];
     int fixed = netservers_choice_relay(choice);
     std::string preview = choice == NETCHOICE_AUTO ? automatic : choice == NETCHOICE_ALL ? all :
-        choice == NETCHOICE_CUSTOM ? std::string("Custom: ") + recomp_settings_get_text("online", "server", buf, sizeof(buf), "") :
+        choice == NETCHOICE_CUSTOM ? std::string("Custom: ") + recomp_settings_get_text("online", "server_debug", buf, sizeof(buf), "") :
         fixed >= 0 && fixed < n ? server_line(s[fixed]) : automatic;
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20);
     if (ImGui::BeginCombo("Server", preview.c_str())) {
@@ -2821,9 +2860,8 @@ static void server_widget()
         ImGui::EndCombo();
     }
     ImGui::SetItemTooltip("Where you play online. Automatic takes the server with the lowest ping when you go online. "
-                          "Quick Match looks on your server first, then (when nobody is there) on the other US server "
-                          "after 10 s and on every server after 30 s; accounts and stats are shared. All servers: the "
-                          "rooms of Europe, US East and Asia in one list; matches across the ocean have higher ping.");
+                          "Quick Match looks on your server first, then (when nobody is there) on every server after 30 s; "
+                          "accounts and stats are shared. All servers: the rooms of every server in one list; matches across the ocean have higher ping.");
 }
 
 static void page_basics()
@@ -2834,8 +2872,10 @@ static void page_basics()
     settings_group("display", { "widescreen", "crowd_near" });
     ImGui::SeparatorText("Voice chat");
     settings_group("online", { "voice", "voice_key", "voice_pad" });
+    ImGui::SeparatorText("Music");
+    settings_group("audio", { "next_song_key", "next_song_pad" });
+    ImGui::TextDisabled("Skips to the next song in the menus and in fights. Only you hear it, online too.");
     ImGui::SeparatorText("Online");
-    server_widget();
     settings_group("ui", { "button_icons" });
     discord_status_setting();
     settings_group("online", { "hill_watch", "name_tags", "perfect_banner", "delay_display" });
@@ -2848,8 +2888,13 @@ static void page_basics()
         ImGui::TextDisabled("Beta: used only when the other player has it on too. Applies the next time the game starts.");
     }
     crossplay_setting();
+    p2p_setting();
     ImGui::SeparatorText("Gameplay");
     offline_countdown_setting();
+    ImGui::SeparatorText("Community content");
+    settings_group("content", { "community_offline" });
+    ImGui::TextDisabled("Off: offline play has only the game's own fighters and venues, so your own mods do not clash with "
+                        "the community packs (they stay installed). Online asks to restart with it on. Applies on the next start.");
     ImGui::SeparatorText("HD textures");
     settings_group("textures", { "enabled" });
     ImGui::TextDisabled("Experimental: they can cause white screens or wrong pictures. Make them under Advanced, Textures.");
@@ -3400,6 +3445,10 @@ static UiResult draw_launcher(float x, float y, float width, float height)
         static bool opened;
         const char *want = getenv("RECOMP_LAUNCHER_PAGE");
         if (!opened && want && !strcmp(want, "saves")) ImGui::OpenPopup("Saves");
+        else if (!opened && want && !strcmp(want, "saves-cloud")) {
+            g_sp.cloud_tab = true;      // the Saves page on its CLOUD view (cloud saves, build 91)
+            ImGui::OpenPopup("Saves");
+        }
         else if (!opened && want && !strcmp(want, "content")) ImGui::OpenPopup("Content");
         else if (!opened && start_page >= 0) ImGui::OpenPopup("Settings");
         opened = true;
@@ -3415,6 +3464,12 @@ static UiResult draw_launcher(float x, float y, float width, float height)
     crash_popup();
     outside_launcher_notice();
     gpu_notice();
+    // Cloud saves (build 91): once per run, signed in: the saves go up when they changed here, or a question
+    // when the cloud has saves this PC does not (pc_launcher_cloud.h). The launcher opens again when the game
+    // closes, so this is also the upload after a game.
+    account_init();
+    pccloud::check(true);
+    cloud_start_prompt();
     ImGui::End();
     return result;
 }
@@ -3734,6 +3789,8 @@ int g_overlay_vk = VK_F1;
 struct Chord { int src[3]; int n; UiTick since; bool fired; };
 std::vector<Chord> g_chords;        // read and written on the drawing thread, and by apply_settings under the lock
 std::vector<Chord> g_mark_chords;   // [debug] mark_pad: the recorder's mark, from a pad
+std::vector<Chord> g_song_chords;   // [audio] next_song_pad (next_song.h)
+std::atomic<int> g_next_song_vk{'M'};   // [audio] next_song_key (0: none)
 
 void parse_chord_list(const std::string &text, std::vector<Chord> &chords)
 {
@@ -3762,6 +3819,34 @@ void parse_chords()
 {
     parse_chord_list(get_text("ui", "overlay_pad"), g_chords);
     parse_chord_list(get_text("debug", "mark_pad"), g_mark_chords);
+    parse_chord_list(get_text("audio", "next_song_pad"), g_song_chords);
+}
+
+// [audio] next_song_pad: a chord acts at once, when its last button goes down, on any pad, while the
+// overlay is shut (its own screens read the pads). Not while the left stick is in as well, unless the
+// chord names it (L3+R3 is the overlay's chord).
+void next_song_pad_poll()
+{
+    if (g_song_chords.empty()) return;
+    InputRaw all;
+    memset(&all, 0, sizeof(all));
+    for (int slot = 0; slot < 4; slot++) {
+        InputRaw raw;
+        if (!xbox_HostInputRawPad(slot, &raw)) continue;
+        for (int s = 0; s < INPUT_SRC_COUNT; s++)
+            if (raw.src[s] > all.src[s]) all.src[s] = raw.src[s];
+    }
+    bool shut = !g_open.load() && !g_note_shown.load() && !ui_capturing();
+    for (Chord &c : g_song_chords) {
+        bool held = true, names_l3 = false;
+        for (int i = 0; i < c.n; i++) {
+            held = held && all.src[c.src[i]] >= 16384;
+            names_l3 = names_l3 || c.src[i] == INPUT_SRC_LEFT_STICK_CLICK;
+        }
+        if (!names_l3 && all.src[INPUT_SRC_LEFT_STICK_CLICK] >= 16384) held = false;
+        if (held && !c.fired && shut) next_song_request("pad");
+        c.fired = held;
+    }
 }
 
 // A chord of `chords` was just completed, on any pad: one button at once, two or three held half a second.
@@ -4419,6 +4504,9 @@ extern "C" void pc_ui_apply_settings(void)
     std::string key = get_text("ui", "overlay_key");
     int vk = xbox_InputMap_KeyFromName(key.c_str());
     g_overlay_vk = vk > 0 ? vk : VK_F1;
+    std::string song_key = get_text("audio", "next_song_key");
+    int song_vk = song_key.empty() ? 0 : xbox_InputMap_KeyFromName(song_key.c_str());
+    g_next_song_vk = song_vk > 0 && song_vk != g_overlay_vk ? song_vk : 0;
     parse_chords();
     if (g_ready) ui_apply_scale(g_window);
     ui_unlock();
@@ -4449,6 +4537,15 @@ extern "C" int pc_ui_window_message(HWND window, UINT msg, WPARAM wp, LPARAM lp)
     bool note = g_note_shown.load();
     if (note && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && ((int)wp == VK_F9 || (int)wp == g_overlay_vk))
         return 1;
+    // [audio] next_song_key (next_song.h): a new press, unless something is typed in (a chat, a name, a key
+    // being bound). The key goes on to the game and the overlay as before: the game has no use for it.
+    if (!note && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !(lp & (1 << 30)) && g_next_song_vk.load() &&
+        (int)wp == g_next_song_vk.load() && (int)wp != g_overlay_vk) {
+        ui_lock();
+        bool typing = ui_capturing() || g_fc_typing.load() || (g_ready && ImGui::GetIO().WantTextInput);
+        ui_unlock();
+        if (!typing) next_song_request("key");
+    }
     // The note offer after an online match: the Y key, unless a text field (room chat) has the keys.
     if (!note && g_offer_visible.load() && msg == WM_KEYDOWN && (int)wp == 'Y' && !(lp & (1 << 30))) {
         ui_lock();
@@ -4579,6 +4676,7 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
     ui_lock();
     bool toggled = g_toggle.exchange(false);
     pad_mark_poll();
+    next_song_pad_poll();
     if (!ui_capturing() && !g_chords.empty() && pad_toggle_pressed()) toggled = true;
     if (toggled && !g_note.open) set_open(!g_open.load());
     release_input_when_idle();
@@ -4609,6 +4707,12 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         if (!g_open.load() && !g_note.open && !toggled && online_screen::take_skin_window_request()) {
             set_open(true);
             g_skin = true;
+        } else if (!g_open.load() && !g_note.open && !toggled && online_screen::take_content_prompt_request()) {
+            // build 90: ONLINE chosen with the community content off: "Online needs FFNY Online's community content.
+            // Restart with it now?" (the UPDATE NOW window; YES restarts with the content on for that run only)
+            set_open(true);
+            g_cupd = true;
+            online_screen::update_prompt_begin_online("online entry");
         } else if (!g_open.load() && !g_note.open && !toggled && content_update_offer_due(online_screen::exit_wanted())) {
             // build 86: new community content: once per news on the main menu, and after each fight
             set_open(true);
@@ -4671,6 +4775,7 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
     // the online menu, it was hidden there); the netplay notices are for the fight only.
     bool toast = bug_report_toast(notice, sizeof(notice)) ||
                  (!g_open.load() && netplay_toast(notice, sizeof(notice))) ||  // online: a wait, a desync
+                 next_song_toast(notice, (int)sizeof(notice), (unsigned long long)ui_ticks()) ||  // "Now playing: ..."
                  (!g_open.load() && online_screen::milestone_toast(notice, sizeof(notice))) ||  // a milestone reached
                  update_notice(notice, sizeof(notice)) ||                       // a newer build is out
                  // build 86: new community content, in any menu (the online screens say it themselves)
@@ -4745,7 +4850,7 @@ extern "C" void pc_ui_overlay(void *device, void *context, void *window_rtv, uns
         // 0 open, 1 LATER, 2 UPDATE NOW (taken: the game closes), 3 the main menu went away
         int answer = g_note.open ? 0 : online_screen::draw_update_prompt(io.DisplaySize, true);
         if (answer) {
-            content_update_offer_answer(answer == 1);
+            online_screen::update_prompt_done(answer);      // (the UPDATE NOW popup's snooze; not the online prompt's)
             close_request = true;
         }
     } else if (g_community) {
@@ -4985,6 +5090,7 @@ int overlay_active(void *)
     ui_lock();
     bool toggled = g_toggle.exchange(false);
     pad_mark_poll();
+    next_song_pad_poll();
     if (!ui_capturing() && !g_chords.empty() && pad_toggle_pressed()) toggled = true;
     if (toggled) set_open(!g_open.load());
     release_input_when_idle();
@@ -5075,6 +5181,13 @@ void overlay_draw(const D3D8VkOverlayFrame *f, void *)
 extern "C" int pc_ui_sdl_event(const void *event, float window_width, float window_height)
 {
     const SDL_Event *e = (const SDL_Event *)event;
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && g_next_song_vk.load() &&
+        host_posix_vk_from_scancode(e->key.scancode) == g_next_song_vk.load()) {
+        ui_lock();
+        bool typing = ui_capturing() || (g_ready && ImGui::GetIO().WantTextInput);
+        ui_unlock();
+        if (!typing) next_song_request("key");
+    }
     if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && recorder_mark_vk() &&
         host_posix_vk_from_scancode(e->key.scancode) == recorder_mark_vk() &&
         host_posix_vk_from_scancode(e->key.scancode) != g_overlay_vk) {

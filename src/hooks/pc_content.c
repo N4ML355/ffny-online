@@ -6,6 +6,7 @@
  * loader, the file system and the netplay which packs are on. */
 #define _CRT_SECURE_NO_WARNINGS
 #include "pc_content.h"
+#include "content_update_logic.h"
 #include "new_fighter_places.h"
 #include "recomp_settings.h"
 #include <ctype.h>
@@ -66,6 +67,54 @@ static const char *data_root(void)
 #endif
 }
 
+/* Build 90, community content in offline play: this run leaves FFNY Online's synced community packs out (the setting
+ * [content] community_offline is 0 and the run was not started for online). Decided once, by the game at its start
+ * (pc_content_decide); the launcher never decides, so its Content page keeps listing everything. */
+static int g_community_off;
+static int g_decided;
+static int g_session_on;        /* started for online (--content-update): on for this run, whatever the setting */
+
+void pc_content_session_online(int forced) { g_session_on = forced != 0; }
+
+/* A run started for online has --content-update on its command line (UPDATE NOW, or the online prompt's restart). */
+static int started_for_online(void)
+{
+#if defined(_WIN32)
+    const char *cmd = GetCommandLineA(), *flag = "--content-update", *p = cmd ? strstr(cmd, flag) : NULL;
+    size_t n = strlen(flag);
+    while (p) {
+        if ((p == cmd || p[-1] == ' ' || p[-1] == 9) && (!p[n] || p[n] == ' ' || p[n] == 9)) return 1;
+        p = strstr(p + n, flag);
+    }
+#endif
+    return 0;
+}
+
+/* Decided on first use: the game's start (the log header, pc_content_start) or the first online connection, whichever
+ * comes first (tests start one before the launcher is done). The launcher's own screens never ask. */
+void pc_content_decide(void)
+{
+    if (g_decided) return;
+    g_decided = 1;
+    g_session_on |= started_for_online();
+    g_community_off = cu_community_off(recomp_settings_get("content", "community_offline", 1), g_session_on);
+}
+
+int pc_content_community_off(void) { return g_community_off; }
+
+int pc_content_online_allowed(void)
+{
+    pc_content_decide();
+    return cu_online_allowed(g_community_off);
+}
+
+/* The folder the composed files are served from, relative to the data folder: the one composition of the community
+ * packs and the player's own, or, with the community content off, the composition of the player's own packs alone
+ * (setup/mods.py compose writes both). */
+#define COMPOSED_DIR "mod-manager" HOST_SEP "content-files"
+#define COMPOSED_OWN_DIR "mod-manager" HOST_SEP "own-packs" HOST_SEP "content-files"
+static const char *composed_dir(void) { return g_community_off ? COMPOSED_OWN_DIR : COMPOSED_DIR; }
+
 static int folder_exists(const char *path)
 {
 #if defined(_WIN32)
@@ -102,15 +151,19 @@ static int valid_id(const char *id)
 static int read_files_ini(const char *root, char *applied, size_t applied_size,
                           char (*files)[256], int max_files, int *nfiles)
 {
-    char path[1024], line[1200];
+    /* The applied line is as long as the list (build 94: 1200 characters cut it at about 70 packs, and the packs
+     * after the cut counted as not applied, the community ones out of the netplay print with them). */
+    size_t line_size = applied_size + 1200;
+    char path[1024], *line;
     FILE *f;
     int in_section = 0, ok = 0;
     if (applied_size) applied[0] = 0;
     if (nfiles) *nfiles = 0;
     if (!root) return 0;
-    snprintf(path, sizeof path, "%s" HOST_SEP "mod-manager" HOST_SEP "content-files" HOST_SEP "files.ini", root);
-    if (!(f = content_fopen(path, "rb"))) return 0;
-    while (fgets(line, sizeof line, f)) {
+    snprintf(path, sizeof path, "%s" HOST_SEP "%s" HOST_SEP "files.ini", root, composed_dir());
+    if (!(line = (char *)malloc(line_size))) return 0;
+    if (!(f = content_fopen(path, "rb"))) { free(line); return 0; }
+    while (fgets(line, (int)line_size, f)) {
         char *s = trim(line), *eq;
         if (*s == '[') { in_section = !strcmp(s, "[content-files]"); continue; }
         if (!in_section || !(eq = strchr(s, '='))) continue;
@@ -127,6 +180,7 @@ static int read_files_ini(const char *root, char *applied, size_t applied_size,
         }
     }
     fclose(f);
+    free(line);
     if (!ok) { if (applied_size) applied[0] = 0; if (nfiles) *nfiles = 0; }
     return ok;
 }
@@ -181,6 +235,197 @@ void pc_content_set_off(const char *id, int off)
     recomp_settings_set_text("content", "off", out);
 }
 
+/* Build 94: small state files of the launcher in <data>/mod-manager, read and written whole. A setting holds at most
+ * 1023 characters (about 60 pack ids); the player's own packs can be several hundred, so which of them are switched
+ * off, and what the master switch remembers, live in files. Writing replaces the file in one step. */
+static int state_file_path(const char *name, char *path, size_t size)
+{
+    const char *root = data_root();
+    size_t i;
+    if (!root || !name || !*name || strlen(name) > 60) return 0;
+    for (i = 0; name[i]; i++)
+        if (!(isalnum((unsigned char)name[i]) || name[i] == '-' || name[i] == '.')) return 0;
+    return snprintf(path, size, "%s" HOST_SEP "mod-manager" HOST_SEP "%s", root, name) < (int)size;
+}
+
+int pc_content_state_read(const char *name, char *out, int size)
+{
+    char path[1400];
+    FILE *f;
+    long len;
+    if (!out || size <= 1) return 0;
+    out[0] = 0;
+    if (!state_file_path(name, path, sizeof path) || !(f = content_fopen(path, "rb"))) return 0;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len < 0 || len > size - 1) { fclose(f); return -1; }
+    len = (long)fread(out, 1, (size_t)len, f);
+    out[len] = 0;
+    fclose(f);
+    return (int)len;
+}
+
+int pc_content_state_write(const char *name, const char *text)
+{
+    char path[1400], tmp[1420], dir[1400];
+    FILE *f;
+    size_t n;
+    int ok;
+    if (!state_file_path(name, path, sizeof path)) return 0;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    snprintf(dir, sizeof dir, "%s" HOST_SEP "mod-manager", data_root());
+#if defined(_WIN32)
+    {
+        WCHAR w[1400], wt[1430];
+        if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, (int)(sizeof w / sizeof w[0])) ||
+            !MultiByteToWideChar(CP_UTF8, 0, tmp, -1, wt, (int)(sizeof wt / sizeof wt[0]))) return 0;
+        if (!text || !*text) { DeleteFileW(w); return 1; }
+        if (!folder_exists(dir)) {
+            WCHAR wd[1400];
+            if (MultiByteToWideChar(CP_UTF8, 0, dir, -1, wd, (int)(sizeof wd / sizeof wd[0]))) CreateDirectoryW(wd, NULL);
+        }
+        f = _wfopen(wt, L"wb");
+        if (!f) return 0;
+        n = strlen(text);
+        ok = fwrite(text, 1, n, f) == n;
+        ok = fclose(f) == 0 && ok;
+        if (ok) ok = MoveFileExW(wt, w, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (!ok) DeleteFileW(wt);
+        return ok;
+    }
+#else
+    if (!text || !*text) { remove(path); return 1; }
+    if (!folder_exists(dir)) mkdir(dir, 0777);
+    f = fopen(tmp, "wb");
+    if (!f) return 0;
+    n = strlen(text);
+    ok = fwrite(text, 1, n, f) == n;
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = rename(tmp, path) == 0;
+    if (!ok) remove(tmp);
+    return ok;
+#endif
+}
+
+/* The ids of the player's own packs that are switched off: <data>/mod-manager/own-off.txt, one id per line. Read at
+ * most once a second (the Content page asks for every pack on every frame); a write updates the copy at once. */
+#define OWN_OFF_FILE "own-off.txt"
+#define OWN_OFF_MAX (1 << 17)
+static char g_own_text[OWN_OFF_MAX];     /* "\n<id>\n<id>\n" */
+static time_t g_own_stamp;
+static int g_own_loaded;
+
+static void own_load(void)
+{
+    char raw[OWN_OFF_MAX];
+    time_t now = time(NULL);
+    char *p, *e;
+    size_t o = 1;
+    if (g_own_loaded && now == g_own_stamp) return;
+    g_own_loaded = 1;
+    g_own_stamp = now;
+    g_own_text[0] = '\n';
+    g_own_text[1] = 0;
+    if (pc_content_state_read(OWN_OFF_FILE, raw, (int)sizeof raw) <= 0) return;
+    for (p = raw; *p;) {
+        char *line = p;
+        for (e = p; *e && *e != '\n'; e++) {}
+        p = *e ? e + 1 : e;
+        *e = 0;
+        line = trim(line);
+        if (!valid_id(line) || o + strlen(line) + 2 >= sizeof g_own_text) continue;
+        o += (size_t)snprintf(g_own_text + o, sizeof g_own_text - o, "%s\n", line);
+    }
+}
+
+static int own_has(const char *id)
+{
+    char key[96];
+    if (!valid_id(id)) return 0;
+    own_load();
+    snprintf(key, sizeof key, "\n%s\n", id);
+    return strstr(g_own_text, key) != NULL;
+}
+
+static int own_save(void)
+{
+    int ok = pc_content_state_write(OWN_OFF_FILE, g_own_text[1] ? g_own_text + 1 : "");
+    g_own_stamp = time(NULL);
+    return ok;
+}
+
+int pc_content_own_is_off(const char *id)
+{
+    return own_has(id) || pc_content_is_off(id);     /* the settings list: builds before 94 kept them there */
+}
+
+int pc_content_own_set_off(const char *id, int off)
+{
+    char key[96];
+    char *at;
+    if (!valid_id(id)) return 0;
+    own_load();
+    snprintf(key, sizeof key, "\n%s\n", id);
+    at = strstr(g_own_text, key);
+    if (at) memmove(at + 1, at + strlen(key), strlen(at + strlen(key)) + 1);       /* drop it */
+    if (off) {
+        size_t n = strlen(g_own_text);
+        if (n + strlen(id) + 2 >= sizeof g_own_text) return 0;
+        snprintf(g_own_text + n, sizeof g_own_text - n, "%s\n", id);
+    }
+    if (pc_content_is_off(id)) pc_content_set_off(id, 0);          /* an old settings entry would switch it off again */
+    return own_save();
+}
+
+int pc_content_own_off_csv(char *out, int size)
+{
+    const char *p;
+    int o = 0;
+    if (!out || size <= 0) return -1;
+    out[0] = 0;
+    own_load();
+    for (p = g_own_text + 1; *p;) {
+        const char *e = strchr(p, '\n');
+        int k = e ? (int)(e - p) : (int)strlen(p);
+        if (!k) break;
+        if (o + k + 2 > size) { out[0] = 0; return -1; }
+        o += snprintf(out + o, (size_t)(size - o), "%s%.*s", o ? "," : "", k, p);
+        p = e ? e + 1 : p + k;
+    }
+    return o;
+}
+
+int pc_content_own_off_put(const char *csv)
+{
+    const char *p;
+    size_t o = 1;
+    char *fresh = (char *)malloc(OWN_OFF_MAX);
+    int ok;
+    if (!fresh) return 0;
+    fresh[0] = '\n';
+    fresh[1] = 0;
+    for (p = csv ? csv : ""; *p;) {
+        char item[128];
+        size_t k = 0;
+        char key[96];
+        while (*p == ',' || *p == ' ') p++;
+        while (*p && *p != ',' && k < sizeof item - 1) item[k++] = *p++;
+        item[k] = 0;
+        while (k && item[k - 1] == ' ') item[--k] = 0;
+        if (!valid_id(item)) continue;
+        snprintf(key, sizeof key, "\n%s\n", item);
+        if (strstr(fresh, key)) continue;
+        if (o + k + 2 >= OWN_OFF_MAX) { free(fresh); return 0; }
+        o += (size_t)snprintf(fresh + o, OWN_OFF_MAX - o, "%s\n", item);
+    }
+    own_load();
+    memcpy(g_own_text, fresh, o + 1);
+    free(fresh);
+    ok = own_save();
+    return ok;
+}
+
 int pc_content_pack_file(const char *id, const char *name, char *out, int size)
 {
     char path[1400];
@@ -202,7 +447,8 @@ int pc_content_pack_file(const char *id, const char *name, char *out, int size)
     return (int)len;
 }
 
-int pc_content_list(PcContentPack *out, int max)
+#define APPLIED_MAX 32768
+static int list_all(PcContentPack *out, int max)
 {
     char path[1024], line[1200];
     const char *root = data_root();
@@ -235,7 +481,7 @@ int pc_content_list(PcContentPack *out, int max)
             if (0) {}
             CONTENT_TEXT(name); CONTENT_TEXT(authors); CONTENT_TEXT(kind); CONTENT_TEXT(type); CONTENT_TEXT(version);
             CONTENT_TEXT(language);
-            CONTENT_TEXT(content_sha256); CONTENT_TEXT(description);
+            CONTENT_TEXT(content_sha256); CONTENT_TEXT(description); CONTENT_TEXT(credits);
             CONTENT_TEXT(bundle); CONTENT_TEXT(bundle_name);
             else if (!strcmp(k, "order")) p->order = atoi(v);
             else if (!strcmp(k, "composed")) p->composed = atoi(v) == 1;
@@ -255,32 +501,57 @@ int pc_content_list(PcContentPack *out, int max)
         }
     }
     fclose(f);
-    {   /* keep only packs whose folder is there; the rest are not installed */
-        static char applied[4096];
+    {   /* keep only packs whose folder is there; the rest are not installed. Not static: any thread lists (build 94,
+         * a shared buffer emptied by another thread's read left packs "not applied" out of the netplay print).
+         * On the heap: 32768 characters for hundreds of own packs (fix/mods-master) is too much for a stack. */
+        char *applied = (char *)malloc(APPLIED_MAX);
         int i, m = 0;
-        read_files_ini(root, applied, sizeof applied, NULL, 0, NULL);
+        if (applied) read_files_ini(root, applied, APPLIED_MAX, NULL, 0, NULL);
         for (i = 0; i < n; i++) {
             char dir[1024];
             snprintf(dir, sizeof dir, "%s" HOST_SEP "mods" HOST_SEP "%s", root, out[i].id);
             out[i].installed = folder_exists(dir);
             if (strcmp(out[i].kind, "content")) strcpy(out[i].kind, "replacement");
-            out[i].off = (out[i].local || !strcmp(out[i].kind, "replacement")) && pc_content_is_off(out[i].id);
-            out[i].applied = out[i].composed && in_list(applied, out[i].id);
+            out[i].off = out[i].local ? pc_content_own_is_off(out[i].id)
+                                      : !strcmp(out[i].kind, "replacement") && pc_content_is_off(out[i].id);
+            out[i].applied = out[i].composed && applied && in_list(applied, out[i].id);
             if (out[i].installed) out[m++] = out[i];
         }
         n = m;
+        free(applied);
     }
     qsort(out, (size_t)n, sizeof *out, by_order);
     return n;
 }
 
+int pc_content_list(PcContentPack *out, int max)
+{
+    int n = list_all(out, max), i, m = 0;
+    if (!g_community_off) return n;
+    /* Build 90: without the community content only the player's own packs and the language packs (the Game language
+     * setting; they never clash with a player's own packs) remain: the rest is installed but not used in this run */
+    for (i = 0; i < n; i++)
+        if (out[i].local || !strcmp(out[i].type, "language")) out[m++] = out[i];
+    return m;
+}
+
+/* Build 94: every caller below lists into its own buffer (malloc). These ran on several threads at once (the
+ * netplay start's build print, its network thread's HELLO, the main thread's [CONTENT] header, the online screen)
+ * and shared one static array: a list another thread was rewriting gave the build print of another content set, and
+ * the relay then kept that player apart from everyone (a quick match that opened a room beside the other player's). */
+static PcContentPack *packs_new(void)
+{
+    return (PcContentPack *)malloc(sizeof(PcContentPack) * PC_CONTENT_MAX);
+}
+
 uint32_t pc_content_print(void)
 {
-    static PcContentPack packs[PC_CONTENT_MAX];
+    PcContentPack *packs;
     const char *test = getenv("RECOMP_TEST_CONTENT_PRINT");
     uint32_t h = 2166136261u;
     int n, i, any = 0;
     if (test && *test) return (uint32_t)strtoul(test, NULL, 16);
+    if (!(packs = packs_new())) return 0;
     n = pc_content_list(packs, PC_CONTENT_MAX);
     for (i = 0; i < n; i++) {
         const char *parts[3];
@@ -300,6 +571,7 @@ uint32_t pc_content_print(void)
         }
         any = 1;
     }
+    free(packs);
     if (!any) return 0;
     return h ? h : 1;
 }
@@ -308,15 +580,15 @@ uint32_t pc_content_print(void)
 
 int pc_content_skins(PcContentSkin *out, int max)
 {
-    static PcContentPack packs[PC_CONTENT_MAX];
+    PcContentPack *packs;
     char path[1024], line[1200];
     const char *root = data_root();
     FILE *f;
     int n = 0, np, in_section = 0;
-    if (!root || max <= 0) return 0;
+    if (!root || max <= 0 || !(packs = packs_new())) return 0;
     np = pc_content_list(packs, PC_CONTENT_MAX);
-    snprintf(path, sizeof path, "%s" HOST_SEP "mod-manager" HOST_SEP "content-files" HOST_SEP "files.ini", root);
-    if (!(f = fopen(path, "rb"))) return 0;
+    snprintf(path, sizeof path, "%s" HOST_SEP "%s" HOST_SEP "files.ini", root, composed_dir());
+    if (!(f = fopen(path, "rb"))) { free(packs); return 0; }
     while (fgets(line, sizeof line, f) && n < max) {
         char *s = trim(line), *fields[4], *q;
         int k, i, ok = 0;
@@ -345,6 +617,7 @@ int pc_content_skins(PcContentSkin *out, int max)
         n++;
     }
     fclose(f);
+    free(packs);
     return n;
 }
 
@@ -357,6 +630,7 @@ int pc_content_news(char *names, int size)
     FILE *f;
     int pending = 0, revision = 0, in_section = 0;
     if (names && size > 0) names[0] = 0;
+    if (g_community_off) return 0;      /* build 90: the content is off in this run: nothing to update */
     if (test && *test) {
         if (names && size > 0) snprintf(names, (size_t)size, "%s", atoi(test) > 0 ? "Doc Nine | The Block" : "");
         return atoi(test) > 0 ? atoi(test) : 0;
@@ -540,13 +814,25 @@ static void sync_line(char *out, size_t size, const char *prefix)
                  s.kind[0] ? s.kind : "-", s.revision, s.packs, s.packs == 1 ? "" : "s", s.time);
 }
 
+/* Build 90: "on", "OFF (setting: ...)" or "on for this run only (restarted for online; the setting is off)". */
+static const char *mode_text(void)
+{
+    if (g_community_off) return "OFF in this run (the setting Community content in offline play is off): the standard "
+                                "fighters, venues and looks only; online is refused until a restart with it on";
+    if (!recomp_settings_get("content", "community_offline", 1))
+        return "on for this run only (the game restarted for online; the saved setting stays off)";
+    return "on";
+}
+
 void pc_content_log_header(void)
 {
     char line[1400], state[1200];
+    pc_content_decide();
     g_print_at_start = pc_content_print();
     sync_line(line, sizeof line, "");
     content_state(state, sizeof state);
-    fprintf(stderr, "[CONTENT] %s\n[CONTENT] installed: %s\n", line, state);
+    fprintf(stderr, "[CONTENT] community content in offline play: %s\n[CONTENT] %s\n[CONTENT] installed: %s\n", mode_text(),
+            line, state);
 }
 
 void pc_content_report_line(void)
@@ -556,6 +842,7 @@ void pc_content_report_line(void)
     sync_line(line, sizeof line, "");
     content_state(state, sizeof state);
     pc_content_news_state(&news);
+    fprintf(stderr, "[REPORT] community content in offline play: %s\n", mode_text());
     fprintf(stderr, "[REPORT] content: %s; %s; check: %s", state, line,
             !news.known ? "none yet" : news.error[0] ? "FAILED" : "ok");
     if (news.known) fprintf(stderr, " (revision %d, %d pending%s%s, %s)", news.revision, news.pending,
@@ -686,11 +973,12 @@ void pc_content_picked_venue(int fe_id)
 
 int pc_content_language_blocked(const char *id)
 {
-    static PcContentPack packs[PC_CONTENT_MAX];
-    int n = pc_content_list(packs, PC_CONTENT_MAX), i;
+    PcContentPack *packs = packs_new();
+    int n = packs ? pc_content_list(packs, PC_CONTENT_MAX) : 0, i, off = 0;
     for (i = 0; i < n; i++)
-        if (!strcmp(packs[i].id, id)) return packs[i].off;
-    return 0;
+        if (!strcmp(packs[i].id, id)) { off = packs[i].off; break; }
+    free(packs);
+    return off;
 }
 
 int pc_content_offline_only(void)
@@ -701,8 +989,8 @@ int pc_content_offline_only(void)
 
 int pc_content_local_offline(char *names, int size)
 {
-    static PcContentPack packs[PC_CONTENT_MAX];
-    int n = pc_content_list(packs, PC_CONTENT_MAX), i, count = 0, o = 0;
+    PcContentPack *packs = packs_new();
+    int n = packs ? pc_content_list(packs, PC_CONTENT_MAX) : 0, i, count = 0, o = 0;
     if (names && size > 0) names[0] = 0;
     for (i = 0; i < n; i++) {
         if (!packs[i].local || packs[i].off || packs[i].online_ok) continue;
@@ -710,6 +998,7 @@ int pc_content_local_offline(char *names, int size)
             o += snprintf(names + o, (size_t)(size - o), "%s%s", count ? ", " : "", packs[i].name[0] ? packs[i].name : packs[i].id);
         count++;
     }
+    free(packs);
     return count;
 }
 
@@ -733,7 +1022,7 @@ static void read_lang_lines(const char *root)
     FILE *f;
     int in_section = 0;
     g_lang_count = 0;
-    snprintf(path, sizeof path, "%s" HOST_SEP "mod-manager" HOST_SEP "content-files" HOST_SEP "files.ini", root);
+    snprintf(path, sizeof path, "%s" HOST_SEP "%s" HOST_SEP "files.ini", root, composed_dir());
     if (!(f = content_fopen(path, "rb"))) return;
     while (fgets(line, sizeof line, f) && g_lang_count < CONTENT_FILES_MAX) {
         char *s = trim(line), *bar;
@@ -787,10 +1076,10 @@ static BOOL content_redirect(const char *relative, content_host_char *host_path,
 
 static void serve_composed_files(const char *root)
 {
-    static char applied[4096];
+    static char applied[32768];
     int i, n = 0;
     if (!root || !read_files_ini(root, applied, sizeof applied, g_files, CONTENT_FILES_MAX, &n) || !n) return;
-    snprintf(g_files_dir, sizeof g_files_dir, "%s" HOST_SEP "mod-manager" HOST_SEP "content-files", root);
+    snprintf(g_files_dir, sizeof g_files_dir, "%s" HOST_SEP "%s", root, composed_dir());
     g_file_count = 0;
     for (i = 0; i < n; i++) {
         char host[1400];
@@ -876,13 +1165,18 @@ void pc_content_start(const char *root)
 #if defined(_WIN32)
     if (data_root()) root = data_root();    /* the caller's root is in the ANSI code page; this one is UTF-8 */
 #endif
+    pc_content_decide();
     {
         const char *v = getenv("RECOMP_CONTENT");
         if (v && !strcmp(v, "0")) { fprintf(stderr, "[CONTENT] off for this run (RECOMP_CONTENT=0)\n"); return; }
     }
+    if (g_community_off)
+        fprintf(stderr, "[CONTENT] community packs are not used in this run: only the player's own packs and language "
+                        "packs (the files come from %s)\n", composed_dir());
     n = pc_content_list(packs, PC_CONTENT_MAX);
     if (!n) {
         PcContentSync last;
+        if (g_community_off) return;
         fprintf(stderr, "[CONTENT] no community packs installed\n");
         /* build 84: the launcher's sync says it installed some, yet this run finds none (the data folder) */
         if (!(tex_root && *tex_root) && pc_content_sync_result(&last) && last.packs > 0 &&

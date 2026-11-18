@@ -53,6 +53,7 @@
 #include "test_observations.h"
 #include "netplay_servers.h"
 #include "netplay_check.h"
+#include "netplay_p2p.h"
 #include "anticheat.h"
 #include "created_fighter.h"
 #include "pc_input.h"
@@ -120,6 +121,7 @@ int netplay_match_locked(void) { return 0; }
 int netplay_voice_room(void) { return 0; }
 void netplay_send_voice(const uint8_t *p, int n) { (void)p; (void)n; }
 int netplay_room_name(int s, char *o, int n) { (void)s; if (n > 0) o[0] = 0; return 0; }
+unsigned netplay_room_account(int s) { (void)s; return 0; }
 int netplay_created_record(int p, uint8_t *o) { (void)p; (void)o; return 0; }
 int netplay_slot_created(int s, char *n, int ns, const char **st) { (void)s; if (ns > 0) n[0] = 0; if (st) *st = ""; return 0; }
 int netplay_created_available(void) { return 0; }
@@ -221,18 +223,14 @@ void netplay_crowd_update(void) { sub_00081170(); }
 
 #include "input_host.h"
 #include "voice.h"
+#include "voice_mute.h"
 
 #ifndef DEFJAM_VERSION
 #define DEFJAM_VERSION "dev"
 #endif
 
 #define DEFAULT_PORT  27777
-#define PROJECT_SERVER_NAME    "play.defjam.online"
-#define PROJECT_SERVER_ADDRESS "49.12.78.32"
-#define PROJECT_NA_NAME        "na.defjam.online"     /* US East (build 30; "North America" until 37) */
-#define PROJECT_NA_ADDRESS     "5.161.206.134"
-#define PROJECT_WEST_NAME      "sg.defjam.online"     /* Asia (Singapore) (build 89; the NETSERVER_WEST slot) */
-#define PROJECT_WEST_ADDRESS   "5.223.88.150"
+/* the project's relays, their host names and fallback addresses: the table in netplay_servers_rules.c (build 91) */
 #define PROTO         1
 #define T_HELLO       0x01
 #define T_WELCOME     0x02
@@ -358,6 +356,14 @@ void netplay_crowd_update(void) { sub_00081170(); }
                                  * with the players' numbers, START (WATCH, WATCHLATE) after the skins with the match's
                                  * numbers; the relay keeps one only where every member announced this bit and has the
                                  * room's content print (server docs/unlimited-fighters-online.md) */
+#define CAPS_RELAYS   268435456u /* 1 << 28 (build 91), both ways: the pings to the relays beyond the first three
+                                 * (South America...): QUICK's and the long RANKED's pings get a trailer (a count, then
+                                 * u16 each, netservers_put_more_pings), and ROOMLIST's listed pings too (server
+                                 * relay/relays.go). Sent only to a relay that answered the bit */
+#define CAPS_PINGSUM  67108864u /* 1 << 26 (build 90), both ways: QUICK ends with this PC's pings to the three relays
+                                 * (u16 each, after the search's choice), and ROOMLIST lists each quick room's (server
+                                 * relay/ping_sum.go): two players meeting across relays play on the one with the
+                                 * smaller sum of their pings (netservers_sum_move) */
 /* build 86: a community fighter number (1000 and up; not the select grid's MORE cell) */
 static int is_number(int fighter) { return fighter >= FB_FIRST_LOGICAL && fighter != FB_MORE_ID; }
 /* Build 86: a community fighter beyond the places (fighter_banks.h, 1000 and up) on the wire: READY's byte is its
@@ -369,6 +375,9 @@ static int unl_template(int number)
     return e && e->template_fe_id >= 0 && e->template_fe_id < 0xFF ? e->template_fe_id : 55;
 }
 
+#define CAPS_DIRECT   NETP2P_CAP /* 1 << 27 (build 90), both ways: this game can take a direct connection (P2P) to the other
+                                 * player of a 1v1 match; the relay: its switch (p2p-allowed) is on. Announced always: the
+                                 * consent is per match, T_P2P is sent only while [online] p2p_direct is on (netplay_p2p.h) */
 /* build 86: CAPS_UNLIMITED unless a test plays an older game (RECOMP_TEST_NO_UNLIMITED) */
 #define CAPS_UNLIMITED_OPT (getenv("RECOMP_TEST_NO_UNLIMITED") ? 0u : CAPS_UNLIMITED)
 #define CP_WAIT_MS    10000     /* START: how long to wait for a created fighter's missing record */
@@ -502,6 +511,7 @@ static struct {
     char room[7];
     char name[25], peer_name[25];
     uint8_t build[8];
+    uint32_t content;               /* build 94: the content print in build[], sent in HELLO (one reading of the packs) */
     uint8_t token[8];
     int have_token;
     int slot;                       /* this client's slot in its room */
@@ -525,6 +535,8 @@ static struct {
     int chat_n;
     unsigned chat_seq;
     char chat_room[7];              /* the room the lines are from */
+    unsigned slot_acct[ROOMSLOTS];  /* the account behind a room slot, from its chat lines (voice mutes, voice_mute.h) */
+    char slot_acct_name[ROOMSLOTS][33];
     int chat_ident;                 /* -1 not asked, -2 fetching a ticket, -3 IDENT being sent, else IDENT_* */
     int chat_mute_min;
     uint8_t chat_ticket[TICKET_LEN];
@@ -1513,6 +1525,191 @@ static int header(uint8_t *b, uint8_t type)
     return 6;
 }
 
+/* ---- direct connection (P2P, opt-in; netplay_p2p.h, docs/research/p2p-optin.md) ---------------
+ * The relay carries every fight packet as before. When both players of a 1v1 match have [online] p2p_direct on
+ * and the relay offers it (CAPS_DIRECT), each game asks the relay for the other's endpoint (T_P2P), punches through
+ * with probes, and once a probe is answered sends its P_STEPS and P_LIVEPAD a second time, directly. The receiver
+ * keeps whichever copy is first; nothing else changes (the delay, the checksums, spectators, voice). The direct
+ * path lost: a short line, and the relay's copies, which never stopped, carry the fight. */
+#define P2P_ASK_TRIES 25        /* T_P2P every RETRY_MS: 10 s for the other player's game to ask too */
+#define P2P_PUNCH_MS  6000      /* probes this long without an answered one: no direct path */
+#define P2P_PROBE_MS  100       /* probes while punching */
+#define P2P_KEEP_MS   250       /* once up: the keepalive (it measures the round trip too) */
+#define P2P_LOST_MS   1000      /* nothing on the direct path this long: down (the relay's copies carry on) */
+enum { P2P_OFF, P2P_ASKING, P2P_PUNCHING, P2P_UP, P2P_DOWN, P2P_GAVE_UP };
+static struct {
+    volatile LONG phase;
+    uint32_t seed;              /* the START it belongs to */
+    int tries, peer_slot, rtt_ms, cut_ms, cut;
+    ULONGLONG asked, began, last_probe, last_rx, up_at, steps_at;   /* steps_at: the first direct P_STEPS */
+    struct sockaddr_in peer;
+    uint8_t key[NETP2P_KEY_LEN];
+    uint32_t probe_seq;
+    unsigned sent, got, first_direct, first_relay, downs;
+} P;
+static int g_rx_direct;         /* net thread: on_data's packet came on the direct path */
+static void on_data(int from, const uint8_t *p, int len);
+static void send_raw(const uint8_t *b, int len);
+static int p2p_setting(void) { return recomp_settings_get("online", "p2p_direct", 0) != 0; }
+
+static void p2p_end(const char *why)
+{
+    LONG was = P.phase;
+    if (was == P2P_OFF) return;
+    InterlockedExchange(&P.phase, P2P_OFF);
+    if (was >= P2P_PUNCHING)
+        fprintf(stderr, "[NETPLAY] direct connection closed (%s): %u packets sent direct, %u came direct; the other "
+                "player's inputs came first on the direct path %u times, through the relay %u times; lost %u time(s)\n",
+                why, P.sent, P.got, P.first_direct, P.first_relay, P.downs);
+}
+
+/* START (under g_cs): a 1v1 match this PC plays asks for the direct path when the player allows it. */
+static void p2p_on_start(int pos, int count, int watching)
+{
+    const char *cut = getenv("RECOMP_TEST_P2P_CUT_MS");
+    p2p_end("a new match");
+    memset(&P, 0, sizeof(P));
+    if (!N.lobby || watching || pos < 0 || count != 2 || N.relay_caps <= 0 || !((unsigned)N.relay_caps & CAPS_DIRECT))
+        return;
+    if (!p2p_setting()) {
+        fprintf(stderr, "[NETPLAY] direct connection: off in this game's settings; the match goes through the server\n");
+        return;
+    }
+    P.seed = N.start_seed;
+    P.cut_ms = cut ? atoi(cut) : 0;     /* tests: the direct path cut (both ways) this long after the first direct P_STEPS */
+    InterlockedExchange(&P.phase, P2P_ASKING);
+    fprintf(stderr, "[NETPLAY] direct connection: allowed here; asking whether the other player allows it too\n");
+}
+
+static void p2p_send(int kind, const uint8_t *body, int n)
+{
+    uint8_t b[1200];
+    int len = netp2p_packet(b, (int)sizeof(b), P.key, kind, body, n);
+    if (len && !P.cut && N.sock != INVALID_SOCKET) {
+        sendto(N.sock, (const char *)b, len, 0, (const struct sockaddr *)&P.peer, (int)sizeof(P.peer));
+        if (kind == NETP2P_DATA) P.sent++;
+    }
+}
+
+/* send_data: the payloads that also go direct, while the direct path is up */
+static void p2p_send_data(const uint8_t *payload, int len)
+{
+    if (P.phase == P2P_UP && len > 0 && netp2p_direct_payload(payload[0]) && N.match_live && N.start_seed == P.seed)
+        p2p_send(NETP2P_DATA, payload, len);
+}
+
+/* The relay's T_P2P answer (net thread). */
+static void p2p_on_answer(const uint8_t *b, int len)
+{
+    NetP2PAnswer a;
+    if (P.phase != P2P_ASKING || !netp2p_answer(b, len, &a) || a.seed != P.seed) return;
+    if (a.status == NETP2P_WAIT) {
+        if (P.tries == 1) fprintf(stderr, "[NETPLAY] direct connection: waiting for the other player's game (its player must allow it too)\n");
+        return;
+    }
+    if (a.status != NETP2P_OK) {
+        fprintf(stderr, "[NETPLAY] direct connection: not for this match (the server's answer); through the server\n");
+        InterlockedExchange(&P.phase, P2P_GAVE_UP);
+        return;
+    }
+    memset(&P.peer, 0, sizeof(P.peer));
+    P.peer.sin_family = AF_INET;
+    memcpy(&P.peer.sin_addr, a.ip, 4);
+    P.peer.sin_port = htons(a.port);
+    memcpy(P.key, a.key, sizeof(P.key));
+    P.peer_slot = a.slot;
+    P.began = GetTickCount64();
+    P.last_probe = P.last_rx = 0;
+    InterlockedExchange(&P.phase, P2P_PUNCHING);
+    /* the address itself is not logged: logs go into F9 reports */
+    fprintf(stderr, "[NETPLAY] direct connection: both players allow it; reaching the other player's game directly\n");
+}
+
+/* A T_DIRECT datagram (net thread): only with this match's key. */
+static void p2p_on_packet(const uint8_t *b, int len)
+{
+    int kind, n;
+    const uint8_t *body;
+    ULONGLONG now = GetTickCount64();
+    if (P.phase < P2P_PUNCHING || P.phase == P2P_GAVE_UP || P.cut) return;
+    if (!netp2p_parse(b, len, P.key, &kind, &body, &n)) return;
+    P.last_rx = now;
+    P.got++;
+    if (kind == NETP2P_PROBE && n >= 8) {
+        p2p_send(NETP2P_ACK, body, 8);
+    } else if (kind == NETP2P_ACK && n >= 8) {
+        uint32_t sent = get32(body + 4);
+        P.rtt_ms = (int)((uint32_t)now - sent);
+        if (P.phase == P2P_PUNCHING) {
+            P.up_at = now;
+            InterlockedExchange(&P.phase, P2P_UP);
+            fprintf(stderr, "[NETPLAY] direct connection up after %u ms (round trip %d ms); the server still carries "
+                    "a copy of every packet\n", (unsigned)(now - P.began), P.rtt_ms);
+        } else if (P.phase == P2P_DOWN) {
+            InterlockedExchange(&P.phase, P2P_UP);
+            fprintf(stderr, "[NETPLAY] direct connection back (round trip %d ms)\n", P.rtt_ms);
+        }
+    } else if (kind == NETP2P_DATA && n >= 1 && netp2p_direct_payload(body[0]) && N.match_live &&
+               N.start_seed == P.seed && P.peer_slot >= 0 && P.peer_slot < ROOMSLOTS) {
+        int from = N.pos_of_slot[P.peer_slot];
+        if (from >= 0 && from < MAXP && from != N.pos) {
+            if (body[0] == P_STEPS && !P.steps_at) P.steps_at = now;
+            g_rx_direct = 1;
+            on_data(from, body, n);
+            g_rx_direct = 0;
+        }
+    }
+}
+
+/* Every pass of the network thread. */
+static void p2p_tick(ULONGLONG now)
+{
+    LONG phase = P.phase;
+    if (phase == P2P_OFF) return;
+    if (!N.match_live || N.start_seed != P.seed || N.state == NETPLAY_FAILED) {
+        p2p_end("the match is over");
+        return;
+    }
+    if (phase == P2P_GAVE_UP) return;
+    if (phase == P2P_ASKING) {
+        if (now - P.asked >= RETRY_MS) {
+            P.asked = now;
+            if (P.tries++ >= P2P_ASK_TRIES) {
+                fprintf(stderr, "[NETPLAY] direct connection: the other player has it off (or an older game); the "
+                        "match goes through the server\n");
+                InterlockedExchange(&P.phase, P2P_GAVE_UP);
+            } else if (N.have_token) {
+                uint8_t b[NETP2P_ASK_LEN];
+                send_raw(b, netp2p_ask(b, N.token, P.seed));
+            }
+        }
+        return;
+    }
+    if (P.cut_ms > 0 && !P.cut && P.steps_at && now - P.steps_at >= (ULONGLONG)P.cut_ms) {
+        P.cut = 1;
+        fprintf(stderr, "[NETPLAY] tests: the direct path is cut here now (both ways)\n");
+    }
+    if (now - P.last_probe >= (phase == P2P_PUNCHING ? P2P_PROBE_MS : P2P_KEEP_MS)) {
+        uint8_t body[8];
+        put32(body, ++P.probe_seq);
+        put32(body + 4, (uint32_t)now);
+        P.last_probe = now;
+        p2p_send(NETP2P_PROBE, body, 8);
+    }
+    if (phase == P2P_PUNCHING && now - P.began > P2P_PUNCH_MS) {
+        fprintf(stderr, "[NETPLAY] direct connection: no direct path between the two PCs (a router or firewall in "
+                "the way); the match goes through the server\n");
+        InterlockedExchange(&P.phase, P2P_GAVE_UP);
+    } else if (phase == P2P_UP && now - P.last_rx > P2P_LOST_MS) {
+        P.downs++;
+        InterlockedExchange(&P.phase, P2P_DOWN);
+        fprintf(stderr, "[NETPLAY] direct connection lost (nothing for %u ms); the relay's copies carry the fight (so far "
+                "the other player's inputs came first direct %u times, through the relay %u times)\n",
+                (unsigned)(now - P.last_rx), P.first_direct, P.first_relay);
+        toast(4000, "Direct connection lost: the fight goes on through the server.");
+    }
+}
+
 static void send_raw(const uint8_t *b, int len)
 {
     if (N.sock != INVALID_SOCKET)
@@ -1533,7 +1730,7 @@ static void send_hello(void)
     {   /* since build 26: the build number, so the relay can turn away builds older than the published one */
         int build = updater_local_build();
         if (build > 0) {
-            uint32_t content = pc_content_print();
+            uint32_t content = N.content;   /* build 94: the print the build field holds, not a second reading */
             put32(b + n, (uint32_t)build); n += 4;
             /* build 72: the content print after the build number, only with content packs (relays
              * before it refuse the longer HELLO; a PC without such packs sends what it sent before) */
@@ -1565,6 +1762,7 @@ static void send_data(const uint8_t *payload, int len)
     memcpy(b + n, N.token, 8); n += 8;
     memcpy(b + n, payload, (size_t)len); n += len;
     send_raw(b, n);
+    p2p_send_data(payload, len);    /* the direct path too, while it is up (P2P) */
 }
 
 /* A hub request: header, token, then `body`. Repeated every RETRY_MS until the server answers
@@ -2302,6 +2500,10 @@ static void store_steps(int from, const uint8_t *p, int len)
         uint32_t s = last - (uint32_t)(count - 1 - i);
         uint32_t k = s % RING;
         if (s == 0) continue;
+        if (N.in_tag[from][k] != s + 1 && P.phase >= P2P_PUNCHING) {     /* P2P: which path brought it first */
+            if (g_rx_direct) P.first_direct++;
+            else P.first_relay++;
+        }
         memcpy(N.in[from][k], p + 9 + i * ENTRY, ENTRY);
         N.in_tag[from][k] = s + 1;
         N.in_match[from][k] = match;
@@ -4036,6 +4238,7 @@ static void on_start_as(const uint8_t *b, int len, int watching)
     N.start_this_play = 1;
     N.start_tick = GetTickCount64();
     N.load_done = N.load_hinted = 0;
+    p2p_on_start(pos, count, watching);     /* the direct connection, when both players allow it */
     N.report_m = m;
     for (i = 0; i < MAXP; i++) {
         N.report_names[i][0] = 0;
@@ -4316,6 +4519,9 @@ static void on_packet(const uint8_t *b, int len)
             if (N.lobby && !N.match_live && NETPLAY_IS_HILL(N.roomv.settings.mode)) break;
             on_data(from, b + 7, len - 7);
         }
+        break;
+    case NETP2P_T_ASK:     /* the direct connection: the other player's endpoint (P2P) */
+        if (N.lobby) p2p_on_answer(b, len);
         break;
     case T_CAPS:
         if (N.lobby && len >= 10) {
@@ -4720,7 +4926,8 @@ static DWORD WINAPI net_thread(LPVOID unused)
                 memcpy(cb + n, N.token, 8); n += 8;
                 put32(cb + n, CAPS_KOTH | NETPLAY_CAP_RTS | CAPS_ORIGINAL | CAPS_CREATED | CAPS_SPECTATE | CAPS_STATS_ERR | CAPS_SPEC_REMATCH | CAPS_CHAT |
                               CAPS_CREW | CAPS_RB_MODES | CAPS_RB_PING | CAPS_RB_FRAMES | CAPS_SPEC_LATE | CAPS_CPULEVEL | CAPS_ROOMRULES | CAPS_UNLIMITED_OPT |
-                              CAPS_TSET | CAPS_FFAROT | CAPS_RANDOM_VENUE | CAPS_HILL_WATCH | CAPS_HILL_READYUP | CAPS_SKINS | CAPS_XPLAY_OPT | CAPS_HILL_CREATED); n += 4;
+                              CAPS_PINGSUM | CAPS_DIRECT | CAPS_RELAYS | CAPS_TSET | CAPS_FFAROT | CAPS_RANDOM_VENUE | CAPS_HILL_WATCH | CAPS_HILL_READYUP |
+                              CAPS_SKINS | CAPS_XPLAY_OPT | CAPS_HILL_CREATED); n += 4;
                 send_raw(cb, n);
             } else {
                 N.relay_caps = 0;
@@ -4887,6 +5094,7 @@ static DWORD WINAPI net_thread(LPVOID unused)
         if (N.lobby && N.match_live && !N.match_seen && now - N.last_rtt_sent >= 100)
             send_rtt();
         if (N.lobby) spec_late_tick();
+        p2p_tick(now);     /* the direct connection (P2P) */
         /* The room is playing but this PC never got its START: a VOTE makes the server send it again.
          * In a King of the Hill room only a fighter has a START to get (the HILL says who fights). */
         if (N.lobby && N.roomv.in_room && N.roomv.phase == 2 && !N.start_this_play && !N.over_pending &&
@@ -4920,6 +5128,10 @@ static DWORD WINAPI net_thread(LPVOID unused)
             FD_ZERO(&rd);
             FD_SET(N.sock, &rd);
             got = select(0, &rd, NULL, NULL, &tv) > 0 ? recv(N.sock, (char *)b, sizeof(b), 0) : 0;
+        }
+        if (got >= 6 && b[5] == NETP2P_T_DIRECT) {     /* the direct connection's own packets (P2P), key-checked */
+            p2p_on_packet(b, got);
+            got = 0;
         }
         if (got > 0 && lag_ms > 0) {        /* tests: hold every arriving packet for a while */
             if (lag_n < LAG_QUEUE) {
@@ -4959,9 +5171,7 @@ static int resolve(const char *server)
     if (getaddrinfo(host, port, &hints, &res) || !res) {
         /* The project's server by its address when its name does not resolve (a resolver that
          * still remembers the name as missing, or a DNS outage). */
-        const char *known = !_stricmp(host, PROJECT_SERVER_NAME) ? PROJECT_SERVER_ADDRESS :
-                            !_stricmp(host, PROJECT_NA_NAME) ? PROJECT_NA_ADDRESS :
-                            !_stricmp(host, PROJECT_WEST_NAME) ? PROJECT_WEST_ADDRESS : NULL;
+        const char *known = netservers_known_ip(host);
         res = NULL;
         if (!known || getaddrinfo(known, port, &hints, &res) || !res)
             return -1;
@@ -4975,7 +5185,7 @@ static int resolve(const char *server)
 
 /* The build's fingerprint: the version, the build number and the lockstep rules. Without the number
  * (builds 21-25) every remaster build had the same one and old and new builds met in rooms. */
-void netplay_build_fingerprint(uint8_t out[8])
+static void build_fingerprint_of(uint8_t out[8], uint32_t content)
 {
     uint32_t h1 = 2166136261u, h2;
     const char *v;
@@ -4987,13 +5197,16 @@ void netplay_build_fingerprint(uint8_t out[8])
      * meets only copies like it. RECOMP_TEST_DETMATH_SAME_FP=1 (tests) lets it meet the others on
      * purpose, to measure the desync the libm difference causes. */
     if (recomp_detmath_mode() == 0 && !getenv("RECOMP_TEST_DETMATH_SAME_FP")) h2 = mix32(h2 ^ 0x444D3000u);
-    {   /* FFNY Online's community content (pc_content.c): a PC with `content` packs (new fighters,
-         * clothing, venues) only meets PCs with the same set. None: the fingerprint builds before
-         * 72 had. Replacements and language packs never count. */
-        uint32_t content = pc_content_print();
-        if (content) { h1 = mix32(h1 ^ content); h2 = mix32(h2 ^ content ^ 0x434F4E54u); }
-    }
+    /* FFNY Online's community content (pc_content.c): a PC with `content` packs (new fighters,
+     * clothing, venues) only meets PCs with the same set. None: the fingerprint builds before
+     * 72 had. Replacements and language packs never count. */
+    if (content) { h1 = mix32(h1 ^ content); h2 = mix32(h2 ^ content ^ 0x434F4E54u); }
     put32(out, h1); put32(out + 4, h2);
+}
+
+void netplay_build_fingerprint(uint8_t out[8])
+{
+    build_fingerprint_of(out, pc_content_print());
 }
 
 static int start(const char *server, const char *name, int creating, const char *room, int delay, int lobby)
@@ -5005,6 +5218,13 @@ static int start(const char *server, const char *name, int creating, const char 
         InterlockedExchange(&N.state, NETPLAY_FAILED);
         set_status("Online is off in this test session (FFNY Studio).");
         fprintf(stderr, "[NETPLAY] refused: online is off in this test session (RECOMP_OFFLINE_ONLY)\n");
+        return -1;
+    }
+    if (!pc_content_online_allowed()) {   /* build 90: the community content is off in this run (offline switch): another content
+                                           * print than everyone's, so never a room or a match; the game offers the restart */
+        InterlockedExchange(&N.state, NETPLAY_FAILED);
+        set_status("%s", CU_ONLINE_REFUSED_TEXT);
+        fprintf(stderr, "[NETPLAY] refused: the community content is off in this run (Community content in offline play)\n");
         return -1;
     }
     {   /* the player's own packs (FFNY Studio, "Use in my game") that add or change more than textures: other
@@ -5028,7 +5248,11 @@ static int start(const char *server, const char *name, int creating, const char 
         if (i != 6) { InterlockedExchange(&N.state, NETPLAY_FAILED); set_status("A room code has 6 characters."); return -1; }
     }
     N.delay = delay >= 1 && delay <= 12 ? delay : 3;
-    netplay_build_fingerprint(N.build);
+    N.content = pc_content_print();
+    build_fingerprint_of(N.build, N.content);
+    /* build 94: the print the relay pairs by (rooms, quick matches and room lists meet only the same one) */
+    fprintf(stderr, "[NETPLAY] build print %02X%02X%02X%02X%02X%02X%02X%02X (content %08X)\n", N.build[0], N.build[1],
+            N.build[2], N.build[3], N.build[4], N.build[5], N.build[6], N.build[7], (unsigned)N.content);
     N.have_token = 0;
     N.peer_name[0] = 0;
     N.rtt_ms = -1;
@@ -5081,6 +5305,11 @@ static int start(const char *server, const char *name, int creating, const char 
         u_long nonblocking = 1;
         ioctlsocket(N.sock, FIONBIO, &nonblocking);
     }
+    {   /* P2P: an ICMP "port unreachable" for a direct probe must not turn the socket's next recv into an error */
+        BOOL reset = FALSE;
+        DWORD ret = 0;
+        WSAIoctl(N.sock, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &reset, sizeof(reset), NULL, 0, &ret, NULL, NULL);
+    }
     N.stop = 0;
     N.hello_sent = 0;
     InterlockedExchange(&N.state, NETPLAY_CONNECTING);
@@ -5116,6 +5345,7 @@ void netplay_stop(void)
         CloseHandle(N.thread);
         N.thread = NULL;
     }
+    p2p_end("offline");
     if (N.sock != INVALID_SOCKET) { closesocket(N.sock); N.sock = INVALID_SOCKET; }
     N.have_token = 0;
     N.lobby = 0;
@@ -5248,6 +5478,8 @@ static void chat_room_check(void)
     snprintf(N.chat_room, sizeof(N.chat_room), "%s", N.roomv.code);
     N.chat_n = 0;
     N.chat_out_n = 0;
+    memset(N.slot_acct, 0, sizeof(N.slot_acct));
+    memset(N.slot_acct_name, 0, sizeof(N.slot_acct_name));
 }
 
 static void chat_add(int slot, unsigned account, int flags, const char *name, int nl, const char *text, int tl)
@@ -5271,6 +5503,13 @@ static void chat_add(int slot, unsigned account, int flags, const char *name, in
         if ((unsigned char)name[i] >= 0x20 && name[i] != 0x7F) l->name[o++] = name[i];
     for (i = o = 0; i < tl && o < (int)sizeof(l->text) - 1; i++)
         if ((unsigned char)text[i] >= 0x20 && text[i] != 0x7F) l->text[o++] = text[i];
+    if (!l->system && account) {    /* who sits in this slot, and what their name is: a muted player is muted by account */
+        vmute_learn(l->name, account);
+        if (slot >= 0 && slot < ROOMSLOTS && !l->spectator) {
+            N.slot_acct[slot] = account;
+            snprintf(N.slot_acct_name[slot], sizeof(N.slot_acct_name[slot]), "%s", l->name);
+        }
+    }
     /* an earlier line: not new (no fight overlay, no unread), and its time is not known */
     l->at = l->history ? 0 : GetTickCount64();
     l->unix_at = l->history ? 0 : (long long)time(NULL);
@@ -5669,12 +5908,32 @@ int netplay_spectating(void)
 
 void netplay_lobby_quick(int mode, int max)
 {
-    int most = room_max(mode), n, original = netplay_original(mode);
-    uint8_t b[5] = { (uint8_t)mode, (uint8_t)(max < 2 ? 2 : max > most ? most : max) };
+    int most = room_max(mode), n, original = netplay_original(mode), i;
+    uint8_t b[11 + 1 + 2 * (NETSERVER_MAX - NETSERVER_LEGACY)] = { (uint8_t)mode, (uint8_t)(max < 2 ? 2 : max > most ? most : max) };
     n = 2 + put_ping(b + 2);
     if (relay_has(CAPS_ORIGINAL)) {     /* build 86: the search's choice after the ping (unknown: 0xFFFF) */
         if (n == 2) { b[2] = b[3] = 0xFF; n = 4; }
         b[n++] = (uint8_t)(original ? 1 : 0);
+        if (relay_has(CAPS_PINGSUM)) {  /* build 90: the pings to the three relays (0 unknown), listed with the room */
+            NetServerInfo sv[NETSERVER_COUNT];
+            int got = netservers_get(sv, NETSERVER_COUNT), pings[NETSERVER_COUNT];
+            char line[160];
+            int at = 0;
+            for (i = 0; i < NETSERVER_COUNT; i++) {
+                int ms = i < got && sv[i].state == NETSERVER_UP && sv[i].ping_ms > 0 ? sv[i].ping_ms : 0;
+                pings[i] = ms > 0xFFFF ? 0xFFFF : ms;
+                at += snprintf(line + at, sizeof(line) - (size_t)at, "%s%s %d", i ? ", " : "", sv[i].id, pings[i]);
+                if (at >= (int)sizeof(line)) at = (int)sizeof(line) - 1;
+            }
+            for (i = 0; i < NETSERVER_LEGACY; i++) {
+                b[n++] = (uint8_t)pings[i];
+                b[n++] = (uint8_t)(pings[i] >> 8);
+            }
+            if (relay_has(CAPS_RELAYS))     /* build 91: and to the relays beyond the three */
+                n += netservers_put_more_pings(b + n, pings, NETSERVER_COUNT);
+            fprintf(stderr, "[NETPLAY] quick match: pings %s ms%s\n", line,
+                    relay_has(CAPS_RELAYS) ? "" : " (the relay takes the first three)");
+        }
     }
     fprintf(stderr, "[NETPLAY] quick match: mode %d, %s%s\n", mode, original ? "original fighters only" : "all fighters",
             relay_has(CAPS_ORIGINAL) ? "" : " (the relay takes no choice)");
@@ -5685,8 +5944,8 @@ void netplay_lobby_quick(int mode, int max)
 static DWORD WINAPI ranked_thread(LPVOID param)
 {
     char ticket[33];
-    uint8_t b[TICKET_LEN + 1 + NETRANK_EXT_LEN];
-    int i, fighter = (int)(INT_PTR)param, pings[3] = { 0, 0, 0 }, n;
+    uint8_t b[TICKET_LEN + 1 + NETRANK_EXT_LEN + 1 + 2 * (NETSERVER_MAX - NETSERVER_LEGACY)];
+    int i, fighter = (int)(INT_PTR)param, pings[NETSERVER_COUNT] = { 0 }, n, len = TICKET_LEN + 1 + NETRANK_EXT_LEN;
     NetServerInfo sv[NETSERVER_COUNT];
     unsigned modes;
     int primary;
@@ -5711,7 +5970,7 @@ static DWORD WINAPI ranked_thread(LPVOID param)
     b[TICKET_LEN] = (uint8_t)fighter;
     /* the long form: the modes, the primary, rollback, the pings to the three relays, a MOVE's code */
     n = netservers_get(sv, NETSERVER_COUNT);
-    for (i = 0; i < n && i < 3; i++) pings[i] = sv[i].state == NETSERVER_UP ? sv[i].ping_ms : 0;
+    for (i = 0; i < n && i < NETSERVER_COUNT; i++) pings[i] = sv[i].state == NETSERVER_UP ? sv[i].ping_ms : 0;
     EnterCriticalSection(&g_cs);
     modes = N.rk_modes;
     primary = N.rk_primary;
@@ -5727,15 +5986,18 @@ static DWORD WINAPI ranked_thread(LPVOID param)
         EnterCriticalSection(&g_cs);
         if (relay_has(CAPS_ORIGINAL) && netplay_original(NETPLAY_ORIGINAL_RANKED))
             b[TICKET_LEN + 1 + 1] |= NETRANK_FLAG_ORIGINAL;    /* build 86: original fighters only: no skins */
+        if (relay_has(CAPS_RELAYS))     /* build 91: the pings to the relays beyond the three, after the code */
+            len += netservers_put_more_pings(b + len, pings, NETSERVER_COUNT);
         LeaveCriticalSection(&g_cs);
     }
-    fprintf(stderr, "[NETPLAY] ranked: queueing for %s (modes %u)%s%s, pings %d/%d/%d ms\n", netranked_mode_title(primary),
-            modes, code[0] ? ", set " : "", code, pings[0], pings[1], pings[2]);
+    fprintf(stderr, "[NETPLAY] ranked: queueing for %s (modes %u)%s%s, pings %d/%d/%d/%d/%d ms (eu/na/sg/sa/mia)\n",
+            netranked_mode_title(primary), modes, code[0] ? ", set " : "", code, pings[0], pings[1], pings[2],
+            pings[NETSERVER_SA], pings[NETSERVER_MIA]);
     EnterCriticalSection(&g_cs);
     i = N.queue_state == NETQUEUE_TICKET;   /* not cancelled meanwhile */
     if (i) N.queue_state = NETQUEUE_CHECKING;
     LeaveCriticalSection(&g_cs);
-    if (i) request(T_RANKED, b, (int)sizeof(b));
+    if (i) request(T_RANKED, b, len);
     return 0;
 }
 
@@ -6651,8 +6913,8 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
     static char chosen[128];
     int i;
     (void)unused;
-    /* RECOMP_NETPLAY_SERVER=auto|eu|na|sg|all: the server choice as a player makes it (build 30), with
-     * RECOMP_NETPLAY_SERVER_EU/_NA/_SG for the relays' addresses; anything else is the address */
+    /* RECOMP_NETPLAY_SERVER=auto|eu|na|sg|sa|all: the server choice as a player makes it (build 30), with
+     * RECOMP_NETPLAY_SERVER_EU/_NA/_SG/_SA for the relays' addresses; anything else is the address */
     if (netservers_choice() != NETCHOICE_CUSTOM) {
         server = netservers_address_wait(chosen, sizeof(chosen), 4000);
         fprintf(stderr, "[NETPLAY] tests: server %s\n", server);
@@ -6721,7 +6983,7 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
         int idle_from = idle_env && *idle_env ? atoi(idle_env) : 0, call_no = 0, idle_told = 0;
         netplay_lobby(server, name && *name ? name : "Test player");
         for (i = 0; i < 600 && N.state == NETPLAY_CONNECTING; i++) Sleep(100);
-        {   /* RECOMP_TEST_SERVER_SWITCH="<ms>,<eu|na|sg|auto>": after that long in the lobby, switch the
+        {   /* RECOMP_TEST_SERVER_SWITCH="<ms>,<eu|na|sg|sa|auto>": after that long in the lobby, switch the
              * server the way the hub's server picker does (netservers_reconnect), then quick-match there */
             const char *sw = getenv("RECOMP_TEST_SERVER_SWITCH");
             if (sw && *sw && strchr(sw, ',')) {
@@ -6748,8 +7010,10 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
             fighter = online_random_fighter();
             fprintf(stderr, "[NETPLAY] tests: RANDOM fighter: %d (%s)\n", fighter, online_fighter_name(fighter));
         }
-        /* the relay lets only a client that announced King of the Hill into such a room */
-        for (i = 0; i < 50 && NETPLAY_IS_HILL(qmode) && N.relay_caps < 0; i++) Sleep(100);
+        /* the relay lets only a client that announced King of the Hill into such a room; build 91: every mode waits
+         * for the CAPS answer, since a QUICK sent before it carries no pings (its room is then listed without them
+         * and the other games fall back to the age rule instead of the ping sum) */
+        for (i = 0; i < 50 && N.relay_caps < 0; i++) Sleep(100);
         /* a created fighter (fighter 99): only once the relay keeps this player's record */
         for (i = 0; i < 100 && fighter == NETPLAY_CREATED_FIGHTER && !netplay_created_available(); i++) Sleep(100);
         if (fighter == NETPLAY_CREATED_FIGHTER)
@@ -6891,7 +7155,7 @@ static DWORD WINAPI autostart_thread(LPVOID unused)
              * 30 s; a player waiting there for this mode is met (at most three moves). The search time
              * runs from the first wait alone and is kept across moves. */
             if (!listed && !strcmp(mode, "quick") && r.in_room && r.phase == 0 && r.player_count < 2 &&
-                !NETPLAY_IS_HILL(r.settings.mode) && !netservers_moving() && moves < 3) {
+                !NETPLAY_IS_HILL(r.settings.mode) && !netservers_moving() && moves < 6) {
                 int waiting = 0, ping = -1, to, search_s, alone_s;
                 unsigned scope = 0;
                 ULONGLONG now = GetTickCount64();
@@ -7259,6 +7523,23 @@ int netplay_room_name(int slot, char *out, int size)
         }
     LeaveCriticalSection(&g_cs);
     return found;
+}
+
+/* The account behind a room slot: known once that player has written a line in this room (the relay names the
+ * account on it), and only while the slot's player is still the one who wrote it (a slot is handed to the next
+ * player who joins); 0 otherwise. */
+unsigned netplay_room_account(int slot)
+{
+    unsigned account = 0;
+    int i;
+    if (slot < 0 || slot >= ROOMSLOTS) return 0;
+    EnterCriticalSection(&g_cs);
+    if (N.slot_acct[slot] && !strcmp(N.chat_room, N.roomv.code))
+        for (i = 0; i < N.roomv.player_count; i++)
+            if (N.roomv.players[i].slot == slot && !strncmp(N.roomv.players[i].name, N.slot_acct_name[slot], 24))
+                account = N.slot_acct[slot];
+    LeaveCriticalSection(&g_cs);
+    return account;
 }
 
 /* ---- the game's hooks ------------------------------------------------------------ */

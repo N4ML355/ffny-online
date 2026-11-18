@@ -18,8 +18,21 @@ enum ChatTab { TAB_ROOM, TAB_GLOBAL, TAB_FRIENDS, TAB_ONLINE, TAB_MESSAGES, TAB_
 const char *const k_tab_names[TAB_COUNT] = { "ROOM", "GLOBAL", "FRIENDS", "ONLINE", "MESSAGES", "CREW" };
 const char *const k_tab_shots[TAB_COUNT] = { "social-room", "social-global", "social-friends", "social-online", "social-messages",
                                              "social-crew" };
-const char *const k_region_ids[4] = { "", "eu", "us-east", "sg" };
-const char *const k_region_names[4] = { "ALL SERVERS", "EUROPE", "US EAST", "US WEST" };
+// GLOBAL's server chips: ALL SERVERS, then one per relay (build 91: the relay table, netservers_def)
+const int REGION_COUNT = 1 + NETSERVER_COUNT;
+// the chip's region id: "" all, else the relay's global chat region ("eu", "us-east", "sg", "sa")
+const char *region_id(int chip) { return chip > 0 && chip <= NETSERVER_COUNT ? netservers_def(chip - 1)->social : ""; }
+// the chip's label: "ALL SERVERS", then each relay's short name (with four relays or fewer its name before any " (")
+std::string region_chip(int chip)
+{
+    if (chip <= 0 || chip > NETSERVER_COUNT) return "ALL SERVERS";
+    // build 91: seven relays: their short names ("EU", "MIAMI", "LOS ANGELES"), so every chip fits the panel
+    std::string n = NETSERVER_COUNT > 4 ? netservers_def(chip - 1)->short_name : netservers_def(chip - 1)->name;
+    size_t paren = n.find(" (");
+    if (paren != std::string::npos) n.resize(paren);
+    for (auto &c : n) c = (char)toupper((unsigned char)c);
+    return n;
+}
 
 const ImU32 GOLD_TEXT = IM_COL32(255, 205, 60, 255), BLUE_NAME = IM_COL32(142, 199, 255, 255),
             LIVE = IM_COL32(123, 224, 123, 255), DIM = IM_COL32(242, 230, 200, 115),
@@ -62,8 +75,7 @@ struct Chat {
     int popup_frame = -1;           // the keyboard or the menu opened in this frame: its press is not theirs
     // ROOM (stage 2b): the room's chat through the relay (netplay.c), the last line seen, local mutes
     unsigned room_seen = 0;
-    std::vector<std::string> room_muted;        // by name (the room's list names players by name)
-    std::vector<unsigned> room_muted_ids;       // by account, when the relay named one
+    // the mutes themselves are voice_mute.h's: one list for voice and text, by account or name, for the session
     bool menu_room = false;                     // the player menu opened from the ROOM tab
     unsigned menu_account = 0;
     // REPORT (stage 2c): the line the menu was opened on, and the lines before it (room lines only
@@ -296,8 +308,7 @@ bool room_only() { return !social_enabled(); }
 bool room_muted(const NetChatLine &l)
 {
     if (l.system || l.mine) return false;
-    for (auto &n : C.room_muted) if (n == l.name) return true;
-    for (unsigned id : C.room_muted_ids) if (id && id == l.account) return true;
+    if (vmute_is_muted(l.name, l.account)) return true;        // MUTE IN ROOM, or 0 % on the VOICE CHAT page
     if (l.account && !room_only()) {    // muted or blocked in the social features too
         for (auto &m : C.v.muted) if (m.id == (long long)l.account) return true;
         for (auto &b : C.v.blocked) if (b.id == (long long)l.account) return true;
@@ -318,23 +329,16 @@ long long room_account_of(const std::string &name)
     return 0;
 }
 
+// Mute or unmute a player for voice and text together (voice_mute.h): by account when it is known, and by name.
 void room_mute(const std::string &name, unsigned account, bool on)
 {
-    auto &ns = C.room_muted;
-    auto &is = C.room_muted_ids;
-    ns.erase(std::remove(ns.begin(), ns.end(), name), ns.end());
-    if (account) is.erase(std::remove(is.begin(), is.end(), account), is.end());
-    if (on) {
-        ns.push_back(name);
-        if (account) is.push_back(account);
-    }
+    vmute_mute(name.c_str(), account, on);
     fprintf(stderr, "[SOCIAL-UI] room chat: %s %s\n", on ? "muted" : "unmuted", name.c_str());
 }
 
 bool room_name_muted(const std::string &name)
 {
-    for (auto &n : C.room_muted) if (n == name) return true;
-    return false;
+    return vmute_is_muted(name.c_str(), 0) || social_player_muted(name.c_str(), 0);
 }
 
 // The room's lines as the chat's lines (oldest first); *last: the newest one's seq.
@@ -463,12 +467,13 @@ std::string ago_text(long long unix_s)
 
 std::string region_label(const std::string &relay)
 {
-    return relay == "eu" ? "Europe" : relay == "us-east" ? "US East" : relay == "sg" ? "Asia (Singapore)" : "";
+    int i = netservers_index_of_social(relay.c_str());
+    return i >= 0 ? netservers_def(i)->name : "";
 }
 
 int server_of_region(const std::string &relay)
 {
-    return relay == "eu" ? NETSERVER_EU : relay == "us-east" ? NETSERVER_NA : relay == "sg" ? NETSERVER_WEST : -1;
+    return netservers_index_of_social(relay.c_str());
 }
 
 // What a friend does, as the FRIENDS list says it, and its colour.
@@ -586,7 +591,7 @@ void chat_send()
     if (lead == std::string::npos) return;
     text = text.substr(lead);
     if (t == TAB_GLOBAL) {
-        std::string region = k_region_ids[C.region];
+        std::string region = region_id(C.region);
         if (region.empty()) region = social::region_of_server(connected_server());
         social::send_global(region.empty() ? "eu" : region.c_str(), text);
     } else if (t == TAB_MESSAGES && C.dm_with) {
@@ -744,7 +749,7 @@ void input_bar(ImDrawList *dl, const Frame &f, float x0, const std::string &plac
 bool line_shown(const social::Line &l)
 {
     if (C.tab != TAB_GLOBAL || C.region == 0) return true;
-    return l.channel == k_region_ids[C.region];
+    return l.channel == region_id(C.region);
 }
 
 // Draws the lines from the bottom of the box up; sel (from the newest, -1 none) gets the marker.
@@ -905,11 +910,12 @@ void draw_global(ImDrawList *dl, const Frame &f, const ChatKeys &k)
 {
     // the server chips
     float x = PX + 14, y = TABS_B + 8;
-    for (int i = 0; i < 4; i++) {
-        float w = text_width(f, g_title, 8.5f, k_region_names[i]) + 14;
+    for (int i = 0; i < REGION_COUNT; i++) {
+        std::string chip = region_chip(i);
+        float w = text_width(f, g_title, 8.5f, chip.c_str()) + 14;
         bool on = C.region == i;
         rect(dl, f, x, y, w, 17, on ? RED : IM_COL32(255, 255, 255, 18), 8.5f);
-        text(dl, f, g_title, 8.5f, x + w / 2, y + 3.5f, on ? IM_COL32(255, 245, 230, 255) : DIM, k_region_names[i], CENTER, 0);
+        text(dl, f, g_title, 8.5f, x + w / 2, y + 3.5f, on ? IM_COL32(255, 245, 230, 255) : DIM, chip.c_str(), CENTER, 0);
         if (mouse_click(f, x, y, w, 17)) C.region = i;
         x += w + 5;
     }
@@ -917,11 +923,11 @@ void draw_global(ImDrawList *dl, const Frame &f, const ChatKeys &k)
     if (C.v.slow_mode > 0) snprintf(info, sizeof(info), "%d online - slow mode %d s", C.v.online, C.v.slow_mode);
     else snprintf(info, sizeof(info), "%d online", C.v.online);
     text(dl, f, g_body, 9, PX + PW - 14, y + 3, DIM, info, RIGHT, 0);
-    if (k.lt) C.region = (C.region + 3) % 4;
-    if (k.rt) C.region = (C.region + 1) % 4;
+    if (k.lt) C.region = (C.region + REGION_COUNT - 1) % REGION_COUNT;
+    if (k.rt) C.region = (C.region + 1) % REGION_COUNT;
     if (C.draft[TAB_GLOBAL].empty() && C.sel[TAB_GLOBAL] < 0) {
-        if (k.left) C.region = (C.region + 3) % 4;
-        if (k.right) C.region = (C.region + 1) % 4;
+        if (k.left) C.region = (C.region + REGION_COUNT - 1) % REGION_COUNT;
+        if (k.right) C.region = (C.region + 1) % REGION_COUNT;
     }
     std::vector<const social::Line *> lines;
     for (auto &l : C.v.global) if (line_shown(l)) lines.push_back(&l);
@@ -938,10 +944,10 @@ void draw_global(ImDrawList *dl, const Frame &f, const ChatKeys &k)
             menu_report_line(lines, (size_t)(n - 1 - s), l.channel);
         }
     }
-    std::string where = C.region ? std::string(k_region_names[C.region]) : "";
+    std::string where = C.region ? region_chip(C.region) : "";
     for (auto &c : where) c = (char)tolower((unsigned char)c);
     std::string ph = C.region == 0 ? "Message everyone on your server" : "Message everyone on " +
-                     std::string(C.region == 1 ? "Europe" : C.region == 2 ? "US East" : "Asia (Singapore)");
+                     region_label(region_id(C.region));
     input_bar(dl, f, PX, ph, "SEND");
 }
 
@@ -951,7 +957,8 @@ void open_keyboard(int kind);       // the on-screen keyboard, below
 
 std::string region_name(const std::string &r)
 {
-    return r == "eu" ? "Europe" : r == "us-east" ? "US East" : r == "sg" ? "Asia (Singapore)" : r;
+    int i = netservers_index_of_social(r.c_str());
+    return i >= 0 ? netservers_def(i)->name : r;
 }
 
 std::string month_year(long long unix_s)
@@ -1075,7 +1082,9 @@ void crew_join_battle()
     if (!netplay_in_lobby()) { say("Connect to the online hub first."); return; }
     std::string here = social::region_of_server(connected_server());
     if (!bt.region.empty() && !here.empty() && here != bt.region) {
-        say("The battle runs on " + region_name(bt.region) + ": switch the server in the hub, then JOIN BATTLE.");
+        int to = netservers_index_of_social(bt.region.c_str());     // build 91: no server choice; the hub moves
+        if (to >= 0) { netservers_use(to); netservers_reconnect(hub_name().c_str()); }
+        say("The battle runs on " + region_name(bt.region) + ": moving there, then press JOIN BATTLE again.");
         return;
     }
     if (!(lobby_caps() > 0 && (lobby_caps() & NETPLAY_CAP_CREW))) { say("This server does not run crew battles yet."); return; }
@@ -1505,7 +1514,7 @@ void draw_room_tab(ImDrawList *dl, const Frame &f, const ChatKeys &k, const NetR
         }
         y += 17;
     }
-    text(dl, f, g_body, 8.5f, PX + 12, PY + PH - 34, DIM, room_only() ? "Pick a name: mute in this room." :
+    text(dl, f, g_body, 8.5f, PX + 12, PY + PH - 34, DIM, room_only() ? "Pick a name: mute their voice and chat." :
          "Pick a name: add friend or mute.", LEFT, 0, lw - 24);
 
     // the room's chat, newest at the bottom, the name and time above each line as the design has it
@@ -2174,8 +2183,7 @@ void draw_player_menu(ImDrawList *dl, const Frame &f, const ChatKeys &k)
     for (auto &b : C.v.blocked) blocked |= C.menu_id && b.id == C.menu_id;
     for (auto &o : C.v.out) asked |= C.menu_id ? o.id == C.menu_id : o.name == C.menu_name;
     if (C.menu_room) {      // the ROOM tab: hide this player's room lines on this PC
-        bool rm = room_name_muted(C.menu_name);
-        for (unsigned id : C.room_muted_ids) rm |= C.menu_account && id == C.menu_account;
+        bool rm = vmute_is_muted(C.menu_name.c_str(), C.menu_account);
         items.push_back({ rm ? "UNMUTE IN ROOM" : "MUTE IN ROOM", rm ? 5 : 4 });
     }
     if (!room_only() && !self) {
@@ -2520,7 +2528,7 @@ void draw_keyboard(ImDrawList *dl, const Frame &f, ImVec2 display)
     else if (C.kb_kind == KB_CREW_CHALLENGE) { head = "CHALLENGE A CREW - ITS TAG"; who = ""; }
     else if (C.tab == TAB_MESSAGES) { head = "MESSAGE TO"; who = convo_name(C.dm_with); }
     else if (C.tab == TAB_CREW) { head = "MESSAGE TO"; who = "your crew"; }
-    else { head = "MESSAGE TO"; who = C.region ? k_region_names[C.region] : "everyone"; }
+    else { head = "MESSAGE TO"; who = C.region ? region_chip(C.region) : "everyone"; }
     text(dl, f, g_title, 13, x + in, y + 14, IM_COL32(242, 230, 200, 180), head.c_str(), LEFT, 0);
     if (!who.empty())
         text(dl, f, g_hand, 17, x + in + text_width(f, g_title, 13, head.c_str()) + 6, y + 12, CREAM, who.c_str(), LEFT, 0.6f);
@@ -2779,7 +2787,7 @@ void chat_test_step()
     } else if (what == "text") {
         ImGui::GetIO().AddInputCharactersUTF8(arg.c_str());
     } else if (what == "mute" || what == "unmute") {    // the ROOM tab's MUTE IN ROOM on that player
-        room_mute(arg, 0, what == "mute");
+        room_mute(arg, room_only() ? 0 : (unsigned)room_account_of(arg), what == "mute");     // as the ROOM tab does
     } else if (what == "crewcreate") {              // the keyboard's name, NEXT, its tag, CREATE
         C.open = true;
         C.tab = TAB_CREW;
@@ -2912,7 +2920,7 @@ bool quick_send(int where, int tab, int i)
     if (where != QW_TAB || tab == TAB_ROOM) {
         ok = room_chat_state() == 1 && netplay_room_chat_send(text.c_str());
     } else if (tab == TAB_GLOBAL) {
-        std::string region = k_region_ids[C.region];
+        std::string region = region_id(C.region);
         if (region.empty()) region = social::region_of_server(connected_server());
         social::send_global(region.empty() ? "eu" : region.c_str(), text);
         to = "global";
@@ -3373,6 +3381,21 @@ void open_my_crew()
     C.confirm_leave = C.confirm_decline = false;
     C.opened_at = GetTickCount64();     // the A that chose it is still down: the window takes no press yet
     fprintf(stderr, "[SOCIAL-UI] chat opened (MY CREW, %s)\n", C.v.crew ? "the crew's page" : "no crew");
+}
+
+// Build 90: where the chips (chat_chip) end on the right, 0 when none show: page_title's corner notice keeps clear.
+float chat_chips_right(const Frame &f)
+{
+    if (!social_enabled() && room_chat_state() < 0) return 0;
+    if (C.open || S.page == CODE || S.page == NAME || S.page == QUICK) return 0;
+    int n = C.v.unread + C.v.requests + room_unread();
+    float w = text_width(f, g_title, 10, "CHAT") + text_width(f, g_body, 9, "ENTER") + 26 + (n ? 16 : 0);
+    float right = 320 + w / 2;
+    NetRoom r;
+    lobby_room(&r);
+    if (r.in_room && room_chat_state() == 1)
+        right += 5 + text_width(f, g_title, 10, "QUICK CHAT") + text_width(f, g_body, 9, quick_button_name()) + 23;
+    return right;
 }
 
 // The small CHAT chip on every online page while the window is shut: what opens it, and what is new.

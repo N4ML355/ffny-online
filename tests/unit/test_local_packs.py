@@ -91,7 +91,7 @@ def test_compose_takes_own_packs_that_are_on(tmp_path, monkeypatch):
     monkeypatch.delenv('RECOMP_SETTINGS', raising=False)
     seen = {}
 
-    def compose(data_, game, packs, root=None, log=None, reserved=()):
+    def compose(data_, game, packs, root=None, log=None, reserved=(), portraits=True):
         seen['ids'] = [p['id'] for p in packs]
         return {'applied': [], 'skipped': [], 'files': [], 'unchanged': True}
     monkeypatch.setattr(mods.content_compose, 'compose', compose)
@@ -107,7 +107,7 @@ def test_game_keeps_own_packs_offline():
     netplay = (hooks / 'netplay.c').read_text(encoding='utf-8')
     header = (hooks / 'pc_content.h').read_text(encoding='utf-8')
     assert 'if (packs[i].local) continue;' in content.split('uint32_t pc_content_print(void)')[1].split('\n}\n')[0]
-    assert 'out[i].off = (out[i].local ||' in content
+    assert 'out[i].off = out[i].local ? pc_content_own_is_off(out[i].id)' in content
     start = netplay.split('static int start(const char *server')[1].split('\n}\n')[0]
     assert 'pc_content_local_offline(names, sizeof names)' in start and 'PC_CONTENT_LOCAL_LINE' in start
     assert 'they work offline only. Turn them off in the launcher (Content) to play online.' in header
@@ -179,7 +179,7 @@ def test_compose_moves_an_own_fighter_and_keeps_the_new_place(tmp_path, monkeypa
     manager = mods.Manager(data)
     seen = {}
 
-    def compose(d, game, packs, root=None, log=print, reserved=()):
+    def compose(d, game, packs, root=None, log=print, reserved=(), portraits=True):
         mods.content_compose.settle_places(packs, reserved, log)
         seen['packs'] = packs
         return {'applied': [p['id'] for p in packs], 'skipped': [], 'files': [], 'unchanged': False}
@@ -192,3 +192,54 @@ def test_compose_moves_an_own_fighter_and_keeps_the_new_place(tmp_path, monkeypa
     assert json.loads((folder / 'local.json').read_text(encoding='utf-8'))['fighter_fe_id'] == 100
     assert 'fighter_fe_id=100' in (data / 'mod-manager' / 'content.ini').read_text(encoding='utf-8')
     assert any('moved from place 117 to 100' in s for s in said)
+
+
+def test_compose_also_builds_the_own_packs_alone_for_offline_play_without_community_content(tmp_path, monkeypatch):
+    """Build 90: [content] community_offline=0 serves <data>/mod-manager/own-packs/content-files (only the player's
+    own packs), built by the same compose run that builds content-files."""
+    data = tmp_path / 'data'
+    own_pack(data, 'my-on', install=install_json(entries=[dict(ENTRY, entry='V2BG_03A.xsh', base_entry='V2BG_03A.xsh')]))
+    monkeypatch.delenv('RECOMP_SETTINGS', raising=False)
+    calls = []
+
+    def compose(data_, game, packs, root=None, log=None, reserved=(), portraits=True):
+        calls.append((Path(root).name, [p['id'] for p in packs], portraits))
+        return {'applied': [], 'skipped': [], 'files': [], 'unchanged': True}
+    monkeypatch.setattr(mods.content_compose, 'compose', compose)
+    manager = mods.Manager(data)
+    monkeypatch.setattr(manager, 'composed_packs', lambda: [dict(id='community-fighter', version='1', content_sha256='x',
+                                                                  kind='content', order=1, folder=data)])
+    manager.compose()
+    # the own-packs pass leaves <data>/online-art alone (builds 90-91: its empty set removed every community
+    # fighter's hub portrait and skin picture the full pass had just drawn)
+    assert calls == [('mod-manager', ['community-fighter', 'my-on'], True), ('own-packs', ['my-on'], False)]
+
+
+def test_compose_leaves_out_the_own_packs_in_own_off_txt(tmp_path, monkeypatch):
+    """Build 94: the own packs that are off are listed in <data>/mod-manager/own-off.txt (a setting holds 1023
+    characters, about 60 ids): with 300 own packs the compose step leaves out exactly those, in both passes."""
+    data = tmp_path / 'data'
+    ids = ['my-roster-fighter-%03d' % i for i in range(300)]
+    for pack in ids:
+        own_pack(data, pack, install=install_json(entries=[dict(ENTRY, entry='V2BG_03A.xsh', base_entry='V2BG_03A.xsh')]))
+    off = ids[::2]
+    (data / 'mod-manager').mkdir(exist_ok=True)
+    (data / 'mod-manager' / 'own-off.txt').write_text('\n'.join(off) + '\n', encoding='utf-8')
+    monkeypatch.delenv('RECOMP_SETTINGS', raising=False)
+    calls = []
+
+    def compose(data_, game, packs, root=None, log=None, reserved=(), portraits=True):
+        calls.append((Path(root).name, sorted(p['id'] for p in packs)))
+        return {'applied': [], 'skipped': [], 'files': [], 'unchanged': True}
+    monkeypatch.setattr(mods.content_compose, 'compose', compose)
+    manager = mods.Manager(data)
+    monkeypatch.setattr(manager, 'composed_packs', lambda: [])
+    manager.compose()
+    on = sorted(set(ids) - set(off))
+    assert calls == [('mod-manager', on), ('own-packs', on)]
+    assert len(on) == 150
+    # every one back on: everything is composed
+    (data / 'mod-manager' / 'own-off.txt').write_text('', encoding='utf-8')
+    calls.clear()
+    manager.compose()
+    assert calls == [('mod-manager', sorted(ids)), ('own-packs', sorted(ids))]

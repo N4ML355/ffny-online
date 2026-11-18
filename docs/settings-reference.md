@@ -40,6 +40,12 @@ and what to do when something misbehaves, see [Controllers, keyboard and mouse](
 | `scale` | `100` | Size of the launcher's and overlay's text and controls in percent, 60-250, on top of your display's scaling (full screen on a large monitor is scaled up automatically). |
 | `button_icons` | `auto` | The button symbols on the online screens: `auto` (PlayStation symbols when the controller that plays as player 1 is a PlayStation pad, DualShock 3/4 or DualSense; Xbox letters for any other pad and for the keyboard), `xbox` or `playstation` (cross for A, circle for B, square for X, triangle for Y, L1/R1 for LB/RB). Applies at once. The game's own menus keep their Xbox letters. The symbols are `online-art/ui/ps_*.png`, which setup draws. Launcher **Basics** and **Controls**; overlay **Controls**. Env `RECOMP_BUTTON_ICONS` (a choice name). |
 
+## [cloud]
+
+| Key | Default | Meaning |
+|---|---|---|
+| `saves` | `true` | Cloud saves (build 91): while you are signed in, the launcher keeps your saves (`save/UserData/45410049` and `save/aside`) on the FFNY Online account service, the newest 5 copies, and offers them on a new PC; restoring always asks and backs up first. `false` sends nothing (what is stored stays until **Delete my cloud saves**). Launcher **Saves**, **CLOUD**: *Keep my saves in the cloud*. Env `RECOMP_CLOUD_SAVES`. See [launcher and overlay](launcher-and-overlay.md#cloud-saves-build-91). |
+
 ## [debug]
 
 The play-test recorder: see [Play-test recorder](playtest-recorder.md). Off by default; `--record` on the command
@@ -81,6 +87,13 @@ line turns it on for one run. Every key here is read at start-up.
 | `vignette` | `true` | The darkened screen edges that venues and some scenes draw (part of the game's post effects). `false` removes them. Applies at once. Env `RECOMP_VIGNETTE` (`1` on, `0` off). |
 | `vignette_strength` | `100` | How dark the vignette is, 0-100 percent of the game's own; 0 is the same as off. Applies at once. Env `RECOMP_VIGNETTE_STRENGTH`. [How both work](research/picture-options.md). |
 | `crowd_near` | `fade` | Spectators close to the camera. `fade` is the game's own: they fade out but stay faintly see-through (alpha 0.2) in front of the fight; `hide` drops them until the camera moves away. Only the picture changes (online checksums are unaffected). Applies at once. Launcher: Basics and Advanced, Display ("Crowd near the camera"). Env `RECOMP_CROWD_NEAR` (`fade`, `hide`). |
+
+## [audio]
+
+| Key | Default | Meaning |
+|---|---|---|
+| `next_song_key` | `M` | Skips to the next song of the music playing now, in the menus and in fights (offline and online), with a short "Now playing: <title>" note. One of your own songs (`[music]`) goes on to the next in your list; the game's soundtrack goes on to the next song of its playlist, which holds only the songs that are on. Only your PC hears it: online matches are unaffected (the change is made between two game steps, never in a rollback re-run). Not while you type in a chat. Empty for none. Launcher: Basics, Music ("Next song key"). Test aid: `RECOMP_TEST_NEXT_SONG=40,55` asks for it that many seconds in. |
+| `next_song_pad` | *(empty)* | Controller buttons for the same, pressed together (it acts when the last one goes down), e.g. `back+right_shoulder`; alternatives separated by commas, button names as in `[gamepad]`. The game sees the presses too. Off by default. |
 
 ## [gameplay]
 
@@ -147,6 +160,7 @@ Tests only: `RECOMP_TEST_PERFECT=1` makes every round with a winner a perfect, a
 | Key | Default | Meaning |
 |---|---|---|
 | `crossplay_android` | `false` | Build 80: lets quick match, rooms and King of the Hill pair you with players of the community Android port (by contatg), only in builds that FFNY Online has cleared for cross-play (the relay's switch). Off: you only meet PC players. Ranked never mixes platforms. Sent to the relay as CAPS bit 21 when you go online; takes effect the next time you go online. Launcher: Online, "Play with Android players". |
+| `p2p_direct` | `false` | Build 90: direct connection (P2P) in 1v1 online fights, used only when the other player has it on too and the relay allows it (CAPS bit 27, its `p2p-allowed` switch). The fight's inputs then also go straight between the two PCs; the relay still carries everything, so a failed direct path changes nothing but a short line. The other player's game gets your IP address (DDoS risk); turning it on asks first. Read at each match. Env `RECOMP_P2P_DIRECT`. Launcher: Online, "Direct connection (P2P) in 1v1 fights"; in the game: online menu, VOICE CHAT. `docs/research/p2p-optin.md`. |
 
 ## [gamepad]
 

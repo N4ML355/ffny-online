@@ -503,7 +503,7 @@ def test_new_packs_and_the_inputs_key():
     assert cc.new_packs(packs, today) == {"fresh", "today", "last-day", "ahead"}
     assert cc.new_packs(packs, datetime.date(2026, 11, 14)) == {"fresh", "today", "ahead"}
     assert cc.new_packs([{"id": "no-date", "fighter_fe_id": 101}], today) == set()
-    assert cc.NEW_DAYS == 14 and cc.COMPOSER == 10    # 7: build 85 (6 skins, 7 the 48 places), 8 row names (fix), 9 banks, 10 build 86
+    assert cc.NEW_DAYS == 14 and cc.COMPOSER == 11    # 7: build 85 (6 skins, 7 the 48 places), 8 row names (fix), 9 banks, 10 build 86, 11 own voices beyond the places
     plain = cc.inputs_key("game", packs, [])
     assert plain == cc.inputs_key("game", packs, [], (), set()) != cc.inputs_key("game", packs, [], (), {"fresh"})
     assert cc.inputs_key("game", packs, [], (), {"a", "b"}) == cc.inputs_key("game", packs, [], (), ["b", "a"])
@@ -540,19 +540,41 @@ def test_hub_portraits_are_written_kept_and_removed(tmp_path):
     assert cc.hub_portraits(tmp_path / "none", [], no_template) == [] and not (tmp_path / "none").exists()
 
 
-def test_online_art_rebuild_keeps_the_new_fighters_portraits(tmp_path):
+def _online_art():
     spec = importlib.util.spec_from_file_location("online_art", ROOT / "scripts" / "online-art.py")
     art = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(art)
+    return art
+
+
+def test_online_art_rebuild_keeps_the_new_fighters_portraits(tmp_path):
+    art = _online_art()
     old, new = tmp_path / "online-art", tmp_path / "online-art.tmp"
     (old / "fighters").mkdir(parents=True)
     (new / "fighters").mkdir(parents=True)
-    for name in ("60.png", "99.png", "100.png", "127.png", "128.png"):
+    # 1000 and up: the numbered community fighters beyond the places (their portraits went with every update
+    # until build 94); 128..999 and the stock IDs are the rebuild's own
+    for name in ("60.png", "99.png", "100.png", "127.png", "128.png", "999.png", "1000.png", "1001.png", "x.png"):
         (old / "fighters" / name).write_bytes(name.encode())
-    assert art.keep_new_fighters(old, new) == [100, 127]
-    assert sorted(p.name for p in (new / "fighters").iterdir()) == ["100.png", "127.png"]
-    assert (new / "fighters" / "127.png").read_bytes() == b"127.png"
+    assert art.keep_new_fighters(old, new) == [100, 127, 1000, 1001]
+    assert sorted(p.name for p in (new / "fighters").iterdir()) == ["100.png", "1000.png", "1001.png", "127.png"]
+    assert (new / "fighters" / "1001.png").read_bytes() == b"1001.png"
     assert art.keep_new_fighters(tmp_path / "nowhere", new) == []
+
+
+def test_online_art_rebuild_keeps_the_skin_pictures(tmp_path):
+    art = _online_art()
+    old, new = tmp_path / "online-art", tmp_path / "online-art.tmp"
+    (old / "skins").mkdir(parents=True)
+    new.mkdir()
+    for name in ("studio-a.png", "studio-b.png", "notes.txt"):
+        (old / "skins" / name).write_bytes(name.encode())
+    assert art.keep_skin_pictures(old, new) == ["studio-a.png", "studio-b.png"]
+    assert sorted(p.name for p in (new / "skins").iterdir()) == ["studio-a.png", "studio-b.png"]
+    assert art.keep_skin_pictures(tmp_path / "nowhere", new) == []
+    (tmp_path / "bare").mkdir()
+    assert art.keep_skin_pictures(tmp_path / "bare", tmp_path / "target") == []
+    assert not (tmp_path / "target").exists()      # no skins folder made when none was there
 
 
 # ------------------------------------------------------------ the user's own dump
