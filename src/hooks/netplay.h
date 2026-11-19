@@ -473,6 +473,12 @@ int netplay_room_rollback(int slot);
  * same place in the front end), and the front end is back in the menus (the main menu, or the
  * battle match-type screen that a match's summary leads to). */
 void netplay_sync_point(void);
+/* Build 95 (netplay_lineup_rules.h): automatch, right after the sync point: the lineup every PC of the match plays (a
+ * fighter a player has no row for plays its template or Doc). Offline it changes nothing. */
+struct AutoMatch;
+void netplay_lineup_agree(struct AutoMatch *m);
+/* Build 95: this PC can load `fighter` in a match (a database row, a created fighter, a place or number it has). */
+int netplay_fighter_loadable(int fighter);
 void netplay_on_main_menu(void);
 int netplay_match_abandoned(void);  /* the sync point: a player left before the match was set up */
 
@@ -525,6 +531,9 @@ int netplay_rts_match(void);    /* the running (or last) online fight came from 
 int netplay_rts_rules(void);
 int netplay_rts_room(void);     /* this PC is in a Run the Streets room (between fights too) */
 int netplay_relay_rts(void);    /* the relay answered CAPS with NETPLAY_CAP_RTS */
+/* build 95: and with NETPLAY_CAP_RTS_POINTS (1 << 30): its rooms keep the Points round mode in the rounds byte */
+#define NETPLAY_CAP_RTS_POINTS 1073741824u
+int netplay_relay_rts_points(void);
 int netplay_local_slot(void);   /* tests: this PC's fighter slot in a lockstep fight, -1 otherwise */
 int netplay_fighter_of_room_slot(int slot);  /* the running match's fighter of room slot `slot`, -1 none */
 int netplay_countdown_active(void);  /* this fight has the start countdown (online always; offline per [gameplay] offline_countdown) */

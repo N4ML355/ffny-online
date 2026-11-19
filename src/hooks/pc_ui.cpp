@@ -37,6 +37,7 @@
 #include <vector>
 #include <map>
 #include "pc_ui_model.h"
+#include "text_fold.h"
 #include "pc_mods.h"
 #include "pc_ui_theme.h"
 #include "pc_ui_actions.h"
@@ -76,6 +77,7 @@ extern "C" {
 #include "voice.h"
 #include "online_screen.h"
 #include "rts_social_rules.h"
+#include "rts.h"
 #include "hd_build.h"
 #include "updater.h"
 #include "next_song.h"
@@ -1844,8 +1846,8 @@ static void page_account()
     account_text(text, sizeof(text));
     float w = ImGui::GetFontSize() * 11;
     if (state == ACCOUNT_IN) {
-        if (account_has_discord()) ImGui::TextColored(k_gold, "Signed in with Discord: %s", text);
-        else ImGui::TextColored(k_gold, "Signed in without Discord: %s", text);
+        if (account_has_discord()) ImGui::TextColored(k_gold, "Signed in with Discord: %s", textfold_display(text, TEXTFOLD_WIDE));
+        else ImGui::TextColored(k_gold, "Signed in without Discord: %s", textfold_display(text, TEXTFOLD_WIDE));
         if (ImGui::Button("Sign out", ImVec2(w * 0.7f, 0))) account_sign_out();
         ImGui::SameLine();
         if (account_has_password() || account_password_offered(nullptr, nullptr, 0)) {
@@ -1954,7 +1956,7 @@ static void page_online(UiMode mode)
         char shown[32];
         if (account_game_name(shown, sizeof(shown)))
             ImGui::TextDisabled(account_has_discord() ? "Online you appear as %s, from your Discord account."
-                                                      : "Online you appear as %s, your FFNY name.", shown);
+                                                      : "Online you appear as %s, your FFNY name.", textfold_display(shown, TEXTFOLD_WIDE));
     }
     discord_status_setting();
     settings_group("online", { "hill_watch", "name_tags", "perfect_banner", "delay_display" });
@@ -2864,6 +2866,19 @@ static std::string server_line(const NetServerInfo &s)
                           "accounts and stats are shared. All servers: the rooms of every server in one list; matches across the ocean have higher ping.");
 }
 
+// Build 95: Run the Streets' own camera and minimap choices, for players who have the mode (rts_access; the launcher
+// app without the game has none of these settings and shows nothing). Only this PC sees them.
+static void rts_settings()
+{
+#ifndef DEFJAM_APP
+    if (!rts_access()) return;
+    if (!find("openworld", "fov")) return;
+    ImGui::SeparatorText("Run the Streets");
+    settings_group("openworld", { "fov", "camera_distance", "minimap_team" });
+    ImGui::TextDisabled("Only your PC sees these; the fight is the same for everyone. 0: the game's own field of view.");
+#endif
+}
+
 static void page_basics()
 {
     ImGui::SeparatorText("Picture");
@@ -2891,6 +2906,7 @@ static void page_basics()
     p2p_setting();
     ImGui::SeparatorText("Gameplay");
     offline_countdown_setting();
+    rts_settings();
     ImGui::SeparatorText("Community content");
     settings_group("content", { "community_offline" });
     ImGui::TextDisabled("Off: offline play has only the game's own fighters and venues, so your own mods do not clash with "
