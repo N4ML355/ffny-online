@@ -95,7 +95,7 @@ static RecompSetting g_display_settings[] = {
     { "online", "fighter", RECOMP_SETTING_INT, 55, 0, 2147483647, NULL, NULL, 0,
       "The fighter you pick in online rooms (its Battle-mode ID, or a community fighter's number from 1000); chosen "
       "in the room." },
-    { "online", "fighter_skin", RECOMP_SETTING_INT, 0, 0, 15, NULL, NULL, 0,
+    { "online", "fighter_skin", RECOMP_SETTING_INT, 0, 0, 255, NULL, NULL, 0,
       "The community skin of that fighter you play online (0 its own look, 1.. its skins in the catalogue's order; "
       "build 85); chosen in the room's CHOOSE A LOOK window." },
     { "online", "fighter_tab", RECOMP_SETTING_INT, 0, 0, 2, NULL, NULL, 0,
@@ -322,6 +322,13 @@ static RecompSetting g_display_settings[] = {
       "Controller buttons that skip to the next song, pressed together (it acts when the last one goes down), "
       "e.g. back+right_shoulder; alternatives separated by commas, button names as in [gamepad]. The game sees "
       "the presses too. Empty (the default) for none.", "" },
+    { "audio", "prev_song_key", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+      "The key for the previous song, as on a music player: the first press plays the song from its start, a "
+      "second one within 3 seconds (or a press in a song's first 3 seconds) the song that played before it. "
+      "A letter or digit, F1-F12, Tab, CapsLock, LAlt, Mouse4 or Mouse5. Empty for none.", "N" },
+    { "audio", "prev_song_pad", RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+      "Controller buttons for the previous song, pressed together, as for the next song. Empty (the default) "
+      "for none.", "" },
     { "graphics", "enabled", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
       "Enhanced graphics (community): the ReShade / DLSS pack with presets by Marleymarletto, installed by the "
       "launcher next to the game (Launcher > Graphics). Heavy on the GPU: for NVIDIA RTX cards." },

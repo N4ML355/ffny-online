@@ -20,7 +20,9 @@
 extern "C" {
 #endif
 
-#define PC_CONTENT_MAX 512     /* was 64 (build 93): a player's own roster of several hundred packs was cut off */
+/* Build 94: room for 2048 community skins besides the other packs (each skin is a pack). The arrays that hold a
+ * list are static (zero pages the OS commits only as they are used) or heap, never on the stack. */
+#define PC_CONTENT_MAX 2560
 
 typedef struct PcContentPack {
     char id[96];
@@ -55,13 +57,16 @@ typedef struct PcContentPack {
     int official;           /* build 86: an official map of the FFNY team (catalogue kind "official-map"), always on */
     int rts_map;            /* ... a Run the Streets map (openworld rts.c loads it) */
     char venue_code[8];     /* ... its venue's code ("28A": V2BG_28A), "" unknown */
+    char character[64];     /* build 96: a new fighter's character group (index-v7.json's "character"; char_groups.h),
+                               "" none. Never part of the content print */
+    char version_name[64];  /* ... the version's name in the hub's version window, "" the pack's name */
 } PcContentPack;
 
 /* Build 85, skins: a new-fighter pack the team accepted as an extra outfit of a stock fighter (same gameplay, new
  * look; no place, no Character row). The launcher composed its model files and lists it in content-files/files.ini
  * ("skin=<pack id>|<template feID>|<model>|<name>"), in catalogue order: the skins of one template are numbered
  * from 1 in that order (0 is the template's own look), the same on every PC with the same content print. */
-#define PC_SKIN_MAX 64
+#define PC_SKIN_MAX 2048
 typedef struct PcContentSkin {
     char id[96];            /* the pack id */
     int template_fe_id;

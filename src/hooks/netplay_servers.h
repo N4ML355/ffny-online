@@ -20,6 +20,7 @@
 
 #include "netplay.h"    /* NetRoomInfo */
 #include "netplay_servers_rules.h"
+#include "rings_rules.h"    /* F0: NetRingCard */
 
 #ifdef __cplusplus
 extern "C" {
@@ -143,16 +144,19 @@ int netservers_players(NetServerPlayer *out, int max, int *online);
  * match. A move waits at most 15 s for the new lobby. */
 void netservers_join_on(int server, const char *code, int mode, const char *name);
 void netservers_quick_on(int server, int mode, int max, const char *name);
+/* Watch room `code` on relay `server` (spectator mode): as netservers_join_on, the SPECTATE goes out once
+ * the hub is in that relay's lobby (netservers_tick returns 4). */
+void netservers_spectate_on(int server, const char *code, const char *name);
 /* Carries out a pending join or quick match once the hub is in the right lobby (call it often: every
  * frame of the online screens, the test thread). Returns 0 nothing happened, 1 the JOIN went out,
- * 2 the QUICK went out (*mode: its match type), -1 the move failed (no lobby within 15 s). */
+ * 2 the QUICK went out (*mode: its match type), 3 the ranked set's queue, 4 the SPECTATE, -4 the relay takes no spectators, -1 the move failed (no lobby within 15 s). */
 int netservers_tick(int *mode);
 /* Ranked: the queue said MOVE (QUEUE 6): the hub moves to the host relay and queues there again with
  * the reservation code (netplay_lobby_ranked_again). Call it every frame of the online screens and the
  * test thread. Returns 1 when a move started, -1 when the host relay is unknown (the search ends), 0
  * nothing to do. */
 int netservers_ranked_move(const char *name);
-/* 1 while a join or quick match waits for the move to its relay. */
+/* 1 while a join, quick match or watch waits for the move to its relay. */
 int netservers_moving(void);
 
 /* The staged quick-match search (build 38), this PC alone in its quick room `code` of match type
@@ -168,6 +172,26 @@ int netservers_moving(void);
  * screen's notice. -1 (scope 0) for a custom address and King of the Hill. */
 int netservers_quick_move(int mode, int search_s, int alone_s, const char *code, int *waiting, int *ping,
                           unsigned *scope);
+
+/* ---- F0: every relay's rings (the Fight Complex; community/fight-complex-f0-protocol.md) -------------- */
+
+/* One card of the merged ring list: the ring instance, the relay it is on and this PC's ping to that relay. */
+typedef struct NetRing {
+    NetRingCard card;
+    int server;         /* NETSERVER_* */
+    int ping_ms;        /* -1 unknown */
+} NetRing;
+
+/* Asks every relay that is not offline for its rings (RINGS, no session) when its last ask is `every_ms` old (at
+ * least 3 s). Cheap to call every frame. */
+void netservers_fetch_rings(int every_ms);
+/* The rings to show: every relay's answer up to 12 s old, the relay with the lowest ping first, each in its own
+ * order. Returns the count; *rounds: the finished RINGS rounds this session (0: still asking the first time). A
+ * relay that never answered (no F0) adds nothing. */
+int netservers_rings(NetRing *out, int max, int *rounds);
+/* 1 when room `code` is a ring room seen in a RINGS answer this session (relay `server` first, else any relay's);
+ * its last card into *out (may be NULL). A code of NULL or "": 1 when any ring was seen this session. */
+int netservers_ring_of(int server, const char *code, NetRingCard *out);
 
 #ifdef __cplusplus
 }
