@@ -5,8 +5,8 @@ name: Wine build (fork)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '20 6 * * *'   # daily, a little off the hour
+ # schedule:
+ #   - cron: '20 6 * * *'   # daily, a little off the hour
   push:
     paths: ['fork/**']
 
